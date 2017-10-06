@@ -1,0 +1,2410 @@
+var NT = NT || {};
+
+NT.BC_PLUGIN = (function(){
+	
+	var DEFAULT_AD_ID = "defaultAdId";
+	var PLUGIN_NAME = "BC Plugin";
+	var PLUGIN_VERSION = "5.1.0.9";	// The last internal version is "5.1.0.9.2"
+	
+	var PRINT_PLAYER_STATE = false;	// ATTENTION! This is a resource consuming operation!
+	var IGNORE_CUSTOM_PARAM_CASE = false;	// So, custom parameters are case sensitive.
+	
+	var PREROLL_TIME_RANGE = 0.5;
+	var PLAYER_STABIL_MAX_TIME = 0.4; // Player might fire first timeupdate event for content within this time frame, but it's incorrect.
+	var PLAYER_STABIL_MAX_LIVE_POSITIONS = 5;
+	
+	var PLAYER_ISSUE_INCORRECT_AD_TYPE_USE_POSITION = false;
+	var PLAYER_ISSUE_INCORRECT_AD_TYPE_USE_OFFSET = true;
+	
+	var PLAYER_ISSUE_BOTH_AD_CONT_TIMEUPDATE = true;
+	var PLAYER_ISSUE_ZERO_DURATION = true;
+	
+	var SDK_VERSION_500 = "500";
+	var CMB_FILENAME_500 = "ggcmb500.js";
+
+	var sBcPlugin = [];	// It will be initialized by the pluginHandler function
+	var adPluginVersion = "";
+
+	function BcPlugin(player, params)
+	{
+		var me = this;
+		me.mPlayer = player;
+
+		me.cmsDefaults = null;
+		me.stream_custom_params = null;
+		
+		me.videoType = null;	// NT.PLUGIN.VIDEO_TYPE.LIVE or NT.PLUGIN.VIDEO_TYPE.VOD 
+
+		me.lastCurrentTime = -1;
+		me.isPaused = null;
+		
+		me.actualContentLength = 0;
+		me.renderingAd = false;
+		
+		me.lastId3 = null;
+		me.tracks = [];
+		me.id3track = null;
+		
+		me.tickCount = 0;
+                me.adPaused = false;
+                me.adPos1Sent = false;
+                me.adWithinFirstSec = false;
+                me.lastAdPosSent = 0;
+
+		var mAdAdapters = [ ima3Ad,
+		                   universalAd 
+		                   ];
+		var ldrparams = {};
+		try {
+			ldrparams = JSON.parse(NT.PLUGIN.printObject(params)); // unlink from original object
+			if(!ldrparams)
+				ldrparams = {};
+		}
+		catch(e) {
+			// TODO: log function is not defined here 
+//			log(NT.PLUGIN.DEBUG_LEVEL.ERR, "Plugin parameters cannot be parsed: " + e.message);
+			ldrparams = {};
+		}
+
+		ldrparams["sfcode"] = ldrparams["sfcode"] || "dcr";
+
+		if (ldrparams.hasOwnProperty("default_params")){
+			// Important: We put default_params to cmsDefaults
+			// default_params is a name that is used for for compatibility
+			this.cmsDefaults = ldrparams.default_params;
+			delete ldrparams.default_params; // split default_params to a separate object
+		}
+
+		if (ldrparams.hasOwnProperty("defaults")){
+			this.cmsDefaults = ldrparams.defaults;
+			delete ldrparams.defaults; // split defaults to a separate object
+		}
+
+		if (ldrparams.hasOwnProperty("content_custom_params")){
+			// Important: We put content_custom_params to stream_custom_params
+			// content_custom_params is a name that is used for for compatibility
+			this.stream_custom_params = ldrparams.content_custom_params;
+			delete ldrparams.content_custom_params; // split content_custom_params to a separate object
+		}
+
+		if (ldrparams.hasOwnProperty("custom_fields")){
+			// Important: We put custom_fields to stream_custom_params
+			// custom_fields is a name that is used for for compatibility
+			this.stream_custom_params = ldrparams.custom_fields;
+			delete ldrparams.custom_fields; // split content_custom_params to a separate object
+		}
+
+		if (ldrparams.hasOwnProperty("stream_custom_params")){
+			this.stream_custom_params = ldrparams.stream_custom_params;
+			delete ldrparams.stream_custom_params; // split stream_custom_params to a separate object
+		}
+
+		me.options = {};
+		/*
+		 * The following is a subject to change.
+		 * Setting Cmb filename can be removed in future.
+                 * 
+                 * In case the ggcmb500.js file is required to be used instead of ggcmb510.js
+                 * parameter sdkVersion="500" should be added to the list of Plugin initialization parameters.
+		 */
+		if (ldrparams.hasOwnProperty("sdkVersion"))
+		{
+			if (typeof ldrparams.sdkVersion === "string" && ldrparams.sdkVersion.toUpperCase() == SDK_VERSION_500) {
+//				var addrProtocol = window.location.protocol || "http:";
+				var addrProtocol = window.location.protocol.indexOf("https")==0 ? "https:" : "http:";
+				var sfcode = ldrparams["sfcode"];
+				me.options["cmbPath"] = addrProtocol + "//secure-" + sfcode + ".imrworldwide.com/novms/js/2/" + CMB_FILENAME_500;
+			}
+			delete ldrparams.sdkVersion;
+		}
+		
+		me.mPlugin = new NT.PLUGIN.PluginModule(ldrparams, me, me.options);
+
+		me.mPlugin.log(NT.PLUGIN.DEBUG_LEVEL.PLUGIN, "info: Plugin=" + PLUGIN_NAME + " " + PLUGIN_VERSION);
+		me.mPlugin.log(NT.PLUGIN.DEBUG_LEVEL.PLUGIN, "info: Date/time=" + (new Date()).toUTCString());
+		if (ldrparams.hasOwnProperty("apid")){
+			me.mPlugin.log(NT.PLUGIN.DEBUG_LEVEL.PLUGIN, "info: APID=" + ldrparams.apid);
+		}
+
+		/*
+		 * Move it to a method that can be invoked externally
+		 * 
+		 * Don't do it while initializing the plugin
+		 */
+		me.mPlugin.log(NT.PLUGIN.DEBUG_LEVEL.PLAYER, "[player][event][state] ready");
+		me.mPlugin.log(NT.PLUGIN.DEBUG_LEVEL.PLUGIN, "info: ad plugin version=" + adPluginVersion);
+
+		me.mPlayer.on( "ready", function(evt) {
+                    try {
+			me.mPlugin.log(NT.PLUGIN.DEBUG_LEVEL.PLAYER, "[player][event][state] ready");
+                    } catch(e) { me.mPlugin.log(NT.PLUGIN.DEBUG_LEVEL.ERR, e.message); }
+		});
+		
+		var playerVersion = "UNDEFINED";
+		try {
+		if (me.mPlayer.bcAnalytics && me.mPlayer.bcAnalytics.settings) {
+			var settings = me.mPlayer.bcAnalytics.settings;
+			playerVersion = settings.platformVersion;
+		}
+		} catch(e) { me.mPlugin.log(NT.PLUGIN.DEBUG_LEVEL.ERR, e.message); }
+		me.mPlugin.log(NT.PLUGIN.DEBUG_LEVEL.PLUGIN, "info: player version=" + playerVersion);
+		
+		me.mPlayer.on( "ima3-ready", function(evt) {
+			try {
+			me.mPlugin.log(NT.PLUGIN.DEBUG_LEVEL.PLAYER, "[player][event][state][ads] ima3-ready");
+			var ima3Version = "UNDEFINED";
+			if (me.mPlayer.ima3) 
+				ima3Version = me.mPlayer.ima3.VERSION;
+			me.mPlugin.log(NT.PLUGIN.DEBUG_LEVEL.PLUGIN, "info: ima3 version=" + ima3Version);
+			} catch(e) { me.mPlugin.log(NT.PLUGIN.DEBUG_LEVEL.ERR, e.message); }
+			me.renderingAd = false;
+		});
+
+		me.mPlayer.on( "ima3error", function(evt) {
+                    try {
+			me.mPlugin.log(NT.PLUGIN.DEBUG_LEVEL.PLAYER, "[player][event][state][ads] ima3error");
+                    } catch(e) { me.mPlugin.log(NT.PLUGIN.DEBUG_LEVEL.ERR, e.message); }
+		});
+
+		me.mPlayer.on( "ima3-ad-error", function(evt) {
+                    try {
+			me.mPlugin.log(NT.PLUGIN.DEBUG_LEVEL.PLAYER, "[player][event][state][ads] ima3-ad-error");
+                    } catch(e) { me.mPlugin.log(NT.PLUGIN.DEBUG_LEVEL.ERR, e.message); }
+		});
+
+		me.mPlayer.on( "ads-load", function(evt) {
+                    try {
+			me.mPlugin.log(NT.PLUGIN.DEBUG_LEVEL.PLAYER, "[player][event][state][ads] ads-load");
+                    } catch(e) { me.mPlugin.log(NT.PLUGIN.DEBUG_LEVEL.ERR, e.message); }
+                    me.renderingAd = false;
+		});
+
+		// common ad handling (for all compatible ad modules)
+		me.mPlayer.on( "ads-ad-started", function(evt) {
+			try {
+			me.mPlugin.log(NT.PLUGIN.DEBUG_LEVEL.PLAYER, "[player][event][state][ads] ads-ad-started");
+			// We will try to use adapters in the order they are set in the array. The first one is IMA3.
+			for (i=0; i < mAdAdapters.length; i++) {
+				var isHandled = mAdAdapters[i]();
+				if (isHandled) {
+					break; // this adapter will handle this Ad
+				}
+			}
+			} catch(e) { me.mPlugin.log(NT.PLUGIN.DEBUG_LEVEL.ERR, e.message); }
+		});
+
+		/*
+		 * Legacy ad handling (while IMA3 is not updated to use ads-ad-started)
+		 * As for BC v5 it seems unnecessary to handle this event.
+		 * The event "ads-ad-started" is being fired. Presumably IMA3 fires it.
+		me  .mPlayer.on( "adstart", function() {
+			me.mPlugin.log(NT.PLUGIN.DEBUG_LEVEL.PLAYER, "[player][event][state][ads] adstart (legacy)");
+			me.renderingAd = true; 
+		});
+                */
+
+		me.mPlayer.on("error", function(evt) {
+			try {
+			var err = me.mPlayer.error();
+			if (err) me.mPlugin.log(NT.PLUGIN.DEBUG_LEVEL.PLAYER, "[player][event][state] ERROR: " + NT.PLUGIN.printObject(err));
+			} catch(e) { me.mPlugin.log(NT.PLUGIN.DEBUG_LEVEL.ERR, e.message); }
+		});
+		
+		me.mPlayer.on("loadedmetadata", function(evt) {
+			try {
+			if (me.mPlugin.isInLog(NT.PLUGIN.DEBUG_LEVEL.PLAYER)) {
+				var d = me.mPlayer.duration();
+				me.mPlugin.log(NT.PLUGIN.DEBUG_LEVEL.PLAYER, "[player][event][state] loadedmetadata: " + (me.mPlayer.mediainfo ? me.mPlayer.mediainfo.name : "") + ", duration=" + d);
+			}
+			} catch(e) { me.mPlugin.log(NT.PLUGIN.DEBUG_LEVEL.ERR, e.message); }
+//			me.renderingAd = false;
+/*		
+ * loadedmetadata sometimes (at least on MAC) is fired after preroll completed, which results in closing the session,
+ * and opening it again.
+ * 
+ * This event is fired inconsistently, so we decided not to use it for detecting stream change. So,
+ * the following code is not used now (at least until BC makes loadedmetadata event reliable).  
+ *
+//	var PLAYER_ISSUE_LOADEDMETADATA_AFTER_PREROLL = true;
+			var data = getContentMetadata.call(me, me.mPlayer.mediainfo, 'content');
+			var ev = {"contentMetadata": data};
+
+			if (PLAYER_ISSUE_LOADEDMETADATA_AFTER_PREROLL) {
+				if (me.mPlugin.contentMetadata && me.mPlugin.contentMetadata.assetid == data.assetid) {
+					me.mPlugin.log(NT.PLUGIN.DEBUG_LEVEL.PLAYER, "loadedmetadata - the same assetid=" + data.assetid);
+					return;
+				}
+			}
+
+			me.mPlugin.playerEventReceived(NT.PLUGIN.PLAYER_EVENT.METADATA_LOADED, ev);
+*/			
+			return;
+			/*
+			 * According to documentation https://docs.brightcove.com/en/perform/brightcove-player/guides/cue-points-guide.html
+			 * we should setup the oncuechange event handler inside the "loadedmetadata", not in "loadeddata" !
+			 * 
+			 * But it appeared better to subscribe to that event in "loadeddata" 
+			 */
+		});
+
+		me.mPlayer.on("loadeddata", function(evt) {
+			try {
+			if (me.mPlugin.isInLog(NT.PLUGIN.DEBUG_LEVEL.PLAYER)) {
+				var d = me.mPlayer.duration();
+				me.mPlugin.log(NT.PLUGIN.DEBUG_LEVEL.PLAYER, "[player][event][state] loadeddata: " + (me.mPlayer.mediainfo ? me.mPlayer.mediainfo.name : "") + ", duration=" + d);
+			}
+
+			me.id3track = null;
+			BcPlugin.prototype.bindCueChangeEvents();
+			return;
+			} catch(e) { me.mPlugin.log(NT.PLUGIN.DEBUG_LEVEL.ERR, e.message); }
+		});
+
+		me.mPlayer.on("playing", function(evt) {
+			try {
+			me.mPlugin.log(NT.PLUGIN.DEBUG_LEVEL.PLAYER, "[player][event][state] playing");
+
+			BcPlugin.prototype.bindCueChangeEvents();
+			} catch(e) { me.mPlugin.log(NT.PLUGIN.DEBUG_LEVEL.ERR, e.message); }
+		});
+		
+/*
+ * contentplayback is fired every time the content starts playing:
+ * - after pre-roll
+ * - after mid-roll
+ * - if no pre-roll
+ * 
+ * It is fired even AFTER the content ended, which is strange.
+ * 
+ * BC player ver.5.8.1:
+ * 	Case: Replay the same stream many times. No ads.
+ *  This event is fired only two first times. Then the player stops sending it.   
+ * 
+ */
+		me.mPlayer.on("contentplayback", function(evt) {
+			try {
+			me.mPlugin.log(NT.PLUGIN.DEBUG_LEVEL.PLAYER, "[player][event][state] contentplayback");
+			/* 
+			 * Don't get metadata here! It can be taken in 'loadedmetadata' event handler only! 
+			 */
+			} catch(e) { me.mPlugin.log(NT.PLUGIN.DEBUG_LEVEL.ERR, e.message); }
+			me.renderingAd = false;
+		});
+		
+		me.mPlayer.on("contentupdate", function(evt) {
+			try {
+			if (me.mPlugin.isInLog(NT.PLUGIN.DEBUG_LEVEL.PLAYER)) {
+				me.mPlugin.log(NT.PLUGIN.DEBUG_LEVEL.PLAYER, "[player][event][state] contentupdate: " + (me.mPlayer.mediainfo ? me.mPlayer.mediainfo.name : ""));
+                            	var curSrc = me.mPlayer.currentSrc();
+                                me.mPlugin.log(NT.PLUGIN.DEBUG_LEVEL.PLAYER, "in contentupdate: currentSrc()=" + NT.PLUGIN.printObject(curSrc));
+			}
+			var contentMetadata = getContentMetadata.call(me, me.mPlayer.mediainfo, "content");
+                        // getContentMetadata function sets me.mPlugin.contentId
+
+			var assetid = me.mPlugin.contentId;
+			if (me.mPlugin.isContentChanged(assetid)) {
+				me.tickCount = 0;
+				me.mPlugin.playerEventReceived(NT.PLUGIN.PLAYER_EVENT.PLAYLIST_ITEM_CHANGED, null);
+			}
+                        // Getting it once again, because contentMetadata is reset after PLAYLIST_ITEM_CHANGED
+                        // TODO: optimise it!
+                        contentMetadata = getContentMetadata.call(me, me.mPlayer.mediainfo, "content");
+                        var ev = {"contentMetadata": contentMetadata, "contentId": me.mPlugin.contentId};
+                        me.mPlugin.playerEventReceived(NT.PLUGIN.PLAYER_EVENT.METADATA_LOADED, ev);
+
+                        } catch(e) { me.mPlugin.log(NT.PLUGIN.DEBUG_LEVEL.ERR, e.message); }
+			me.renderingAd = false;
+		});
+
+		me.mPlayer.on("timeupdate", function(evt) {
+			try {
+			if (PRINT_PLAYER_STATE) {
+				if (me.mPlayer.paused() != me.isPaused) {
+					me.isPaused = me.mPlayer.paused(); 
+					me.mPlugin.log(NT.PLUGIN.DEBUG_LEVEL.PLUGIN, "paused=" + me.isPaused);
+				}
+			}
+			
+			var pos = me.getCurrentPlayerPos();
+                        if (pos === null) return;
+			var assetid = me.mPlayer.mediainfo ? me.getContentAssetId(me.mPlayer.mediainfo) : null;
+			me.mPlugin.log(NT.PLUGIN.DEBUG_LEVEL.DEBUG, "[player][event] timeupdate, pos=" + NT.PLUGIN.printObject(pos) + ", id=" + assetid);
+
+			var currPos = pos["position"];
+			if (currPos === null) return;
+
+			if (me.renderingAd) {
+				me.mPlugin.log(NT.PLUGIN.DEBUG_LEVEL.PLUGIN, "[player] Ignoring content timeupdate received when Ad is playing.");
+				return;
+			}
+			
+			if (	me.videoType !== NT.PLUGIN.VIDEO_TYPE.LIVE && (pos["stream_position"] < PLAYER_STABIL_MAX_TIME)
+				||	me.videoType === NT.PLUGIN.VIDEO_TYPE.LIVE && (me.tickCount < PLAYER_STABIL_MAX_LIVE_POSITIONS)) {
+				me.mPlugin.log(NT.PLUGIN.DEBUG_LEVEL.PLUGIN, "Skip position:" + pos["stream_position"]);
+				return;
+			}
+			
+//			if (me.tickCount > PLAYER_STABIL_MAX_LIVE_POSITIONS*2 &&
+			if (me.tickCount >= PLAYER_STABIL_MAX_LIVE_POSITIONS &&
+					me.mPlugin.isContentChanged(assetid)) {
+				
+				me.tickCount = 0;
+				
+				var ev = {"assetid": assetid};
+				me.mPlugin.playerEventReceived(NT.PLUGIN.PLAYER_EVENT.PLAYLIST_ITEM_CHANGED, ev);
+				// Session is closed after that. We need to get new metadata now and fire "cont_tick".
+//				return;
+			}
+
+			if (!me.mPlugin.isContentMetadataCorrect()) {
+				var data = getContentMetadata.call(me, me.mPlayer.mediainfo, 'content');
+				var ev = {"contentMetadata": data, "contentId": me.mPlugin.contentId};
+				me.mPlugin.playerEventReceived(NT.PLUGIN.PLAYER_EVENT.METADATA_LOADED, ev);
+			}
+			
+			me.mPlugin.playerEventReceived(NT.PLUGIN.PLAYER_EVENT.CONT_TICK, pos);
+			} catch(e) { me.mPlugin.log(NT.PLUGIN.DEBUG_LEVEL.ERR, e.message); }
+		});
+
+		me.mPlayer.on("stop", function() {
+			try {
+			me.mPlugin.log(NT.PLUGIN.DEBUG_LEVEL.PLAYER, "[player][event][state] stop");
+			var pos = me.getCurrentPlayerPos();
+                        if (pos === null) return;
+			me.mPlugin.playerEventReceived(NT.PLUGIN.PLAYER_EVENT.CONT_STOPPED, pos);
+			} catch(e) { me.mPlugin.log(NT.PLUGIN.DEBUG_LEVEL.ERR, e.message); }
+		});
+
+		/*
+		 * Now we are not doing anything on event 'ended' because this event is fired inconsistently due to IMA plugin issue.
+		 * It's discussed in BRC developer's forum: https://groups.google.com/forum/#!topic/bcplayerdev/zF18Iwkhf2E
+		 * Sometimes (when we are going to play a live stream ) it's fired after the preroll is completed, which is incorrect.
+		 * So, we detect the ending of the stream by comparing the current position with the length of the stream.
+		 */ 
+		me.mPlayer.on("ended", function() {
+			// Fired when the content is completed. No more content to be played.
+			try {
+			me.mPlugin.log(NT.PLUGIN.DEBUG_LEVEL.PLAYER, "[player][event][state] ended");
+//			var pos = me.getCurrentPlayerPos();
+//                      if (pos === null) return;
+//			me.mPlugin.playerEventReceived(NT.PLUGIN.PLAYER_EVENT.CONT_ENDED, pos);
+			} catch(e) { me.mPlugin.log(NT.PLUGIN.DEBUG_LEVEL.ERR, e.message); }
+		});
+
+		me.mPlayer.on("contentended", function() {
+			// From the BRC developer's forum: https://groups.google.com/forum/#!topic/bcplayerdev/zF18Iwkhf2E
+			// This event fires consistently. Somebody uses it instead of "ended" 
+			try {
+			me.mPlugin.log(NT.PLUGIN.DEBUG_LEVEL.PLAYER, "[player][event][state] contentended");
+//			var pos = me.getCurrentPlayerPos();
+//                      if (pos === null) return;
+//			me.mPlugin.playerEventReceived(NT.PLUGIN.PLAYER_EVENT.CONT_ENDED, pos);
+			} catch(e) { me.mPlugin.log(NT.PLUGIN.DEBUG_LEVEL.ERR, e.message); }
+		});
+
+		function takeAdType() {
+			try {
+			var adType;
+			var adData;
+			if (me.mPlayer.ads && me.mPlayer.ads.ad && me.mPlayer.ads.ad.id){
+				adData = me.mPlayer.ads.ad;
+			} else if (me.mPlayer.ads && me.mPlayer.ads.pod && me.mPlayer.ads.pod.id){
+				adData = me.mPlayer.ads.pod;
+			}
+
+//			me.mPlugin.log(NT.PLUGIN.DEBUG_LEVEL.DEBUG, "me.mPlayer.ads=" + NT.PLUGIN.printObject(me.mPlayer.ads));
+// Sometimes (when working with the player hosted on the server) it results in circular converting to JSON
+			me.mPlugin.log(NT.PLUGIN.DEBUG_LEVEL.DEBUG, "me.mPlayer.ima3.currentAd=" + NT.PLUGIN.printObject(me.mPlayer.ima3.currentAd));
+
+			if (adData && typeof adData.type === "string"){
+				me.mPlugin.log(NT.PLUGIN.DEBUG_LEVEL.DEBUG, "Ad=" + NT.PLUGIN.printObject(adData));
+				adType = adData.type;
+				var t = adType.toLowerCase();
+				if ( ['preroll','midroll','postroll'].indexOf(t) >= 0 ) {
+					adType = t;
+				}
+				me.mPlugin.log(NT.PLUGIN.DEBUG_LEVEL.DEBUG, "From the ad info - adType=" + adType);
+			}
+
+			if (PLAYER_ISSUE_INCORRECT_AD_TYPE_USE_POSITION === true || typeof adType === 'undefined') {
+				var currPos = me.mPlayer.currentTime();	// No rounding
+				// Sometimes when the first preroll starts, the currPos = 0.0067 or so.
+				// Actually it should be considered as 0, because it's a pre-roll
+				// No need to round it, because actualContentLength value is NOT rounded. 
+//				currPos = Math.round(currPos*10) / 10;
+
+				if(me.actualContentLength > 0 && me.actualContentLength-currPos < 0.1) {
+					adType = 'postroll';
+				}
+				else {
+					adType = currPos > PREROLL_TIME_RANGE ? 'midroll' : 'preroll';
+				}
+				me.mPlugin.log(NT.PLUGIN.DEBUG_LEVEL.DEBUG, "From calculating position - adType=" + adType + ", currPos=" + currPos);
+			}
+
+			if (PLAYER_ISSUE_INCORRECT_AD_TYPE_USE_OFFSET === true || typeof adType === 'undefined') {
+				var offset;
+				var currentAd = me.mPlayer.ima3.currentAd;
+				if (typeof currentAd !== 'undefined' && currentAd != null) {
+					if (typeof currentAd.b !== 'undefined') {
+						currentAd = currentAd.b;
+					}
+					// The following is for iOS:
+					else if (typeof currentAd.g !== 'undefined') {
+						currentAd = currentAd.g;
+					}
+					var adPodInfo = currentAd.adPodInfo;
+					
+					me.mPlugin.log(NT.PLUGIN.DEBUG_LEVEL.DEBUG, "adPodInfo=" + NT.PLUGIN.printObject(adPodInfo));
+					
+					if (typeof adPodInfo !== 'undefined') offset = adPodInfo.timeOffset;
+					if (typeof offset !== 'undefined') {
+						if (offset == 0) adType = 'preroll';
+						else if (offset == -1) adType = 'postroll';
+						else adType = 'midroll';
+					}
+					me.mPlugin.log(NT.PLUGIN.DEBUG_LEVEL.DEBUG, "From offset - adType=" + adType + ", offset=" + offset);
+				}
+			}
+			return adType; 
+			} catch(e) { me.mPlugin.log(NT.PLUGIN.DEBUG_LEVEL.ERR, e.message); }
+		}
+		
+		// IMA3 ad source adapter
+		function ima3Ad(onExitAd){
+		try {
+			
+			// IMPORTANT: we should not do any checks for Ad plugins earlier, than actual 'adstart' comes,
+			//   because the order of plugin initialization may vary, and when NielsenBC is being initialized,
+			//   IMA3 may not necessarily be ready
+			if (me.mPlayer.ima3 !== null && typeof me.mPlayer.ima3 === "object") {
+				me.mPlugin.log(NT.PLUGIN.DEBUG_LEVEL.PLAYER, "handling by ima3Ad");
+			} else {
+				return false;
+			}
+
+			var adId;
+			
+			var adType = takeAdType();
+
+			if (me.mPlayer.ima3.currentAd) {
+				// No need to check linear property. According to BRC it's always true if ima3.currentAd exists. 
+				me.renderingAd = true; 
+
+				me.mPlugin.log(NT.PLUGIN.DEBUG_LEVEL.DEBUG, "Getting metadata from ima3.currentAd...");
+				var adMetadata = getContentMetadata.call(me, me.mPlayer.ima3.currentAd, adType, me.mPlayer);
+				if (adMetadata) {
+					var ev2 = {"adMetadata": adMetadata};
+					me.mPlugin.playerEventReceived(NT.PLUGIN.PLAYER_EVENT.AD_METADATA_LOADED, ev2);
+					if (me.mPlugin.isAdMetadataCorrect()) {
+						me.mPlugin.playerEventReceived(NT.PLUGIN.PLAYER_EVENT.AD_STARTED, ev2);
+					}
+				}
+
+				if (me.mPlayer.ima3.adPlayer)
+					me.mPlayer.ima3.adPlayer.on("timeupdate", onAdTimeUpdateIma3);
+//				me.mPlayer.on( "adend", onAdEndedIma3 );
+				me.mPlayer.on( "ads-ad-ended", onAdEndedIma3 );
+			}
+//				onAdTimeUpdateIma3();
+			return true;
+
+			function onAdTimeUpdateIma3() {
+                            try {
+				var dstr = "[player][event][ads] timeupdate (IMA3)=";
+
+				if (me.mPlayer.ima3.currentAd && me.mPlayer.ima3.adPlayer) {
+					var ct = me.mPlayer.ima3.adPlayer.currentTime();
+					dstr += ct;
+					me.mPlugin.log(NT.PLUGIN.DEBUG_LEVEL.DEBUG, dstr);
+
+					if (!me.mPlugin.isAdMetadataCorrect()) {
+						var adType = takeAdType();
+						var adMetadata = getContentMetadata.call(me, me.mPlayer.ima3.currentAd, adType, me.mPlayer);
+						var ev2 = {"adMetadata": adMetadata};
+						me.mPlugin.playerEventReceived(NT.PLUGIN.PLAYER_EVENT.AD_METADATA_LOADED, ev2);
+						
+						if (me.mPlugin.isAdMetadataCorrect()) {
+							me.mPlugin.playerEventReceived(NT.PLUGIN.PLAYER_EVENT.AD_STARTED, null);
+						}
+					}
+					
+					var ev3 = {"position": ct}; // sending EXACT position
+					me.mPlugin.playerEventReceived(NT.PLUGIN.PLAYER_EVENT.AD_TICK, ev3);
+				}
+				else
+					me.mPlugin.log(NT.PLUGIN.DEBUG_LEVEL.DEBUG, dstr);
+                            } catch(e) { me.mPlugin.log(NT.PLUGIN.DEBUG_LEVEL.ERR, e.message); }
+			}
+
+			function onAdEndedIma3(evt) {
+                            try {
+//				me.mPlugin.log(NT.PLUGIN.DEBUG_LEVEL.PLAYER, "[player][event][state][ads] adend (IMA3)");
+				me.mPlugin.log(NT.PLUGIN.DEBUG_LEVEL.PLAYER, "[player][event][state][ads] ads-ad-ended (IMA3)");
+
+				me.mPlugin.playerEventReceived(NT.PLUGIN.PLAYER_EVENT.AD_STOPPED, null);
+
+//				me.mPlayer.off( "adend", onAdEndedIma3);
+				me.mPlayer.off( "ads-ad-ended", onAdEndedIma3 );
+				if (me.mPlayer.ima3.adPlayer)
+					me.mPlayer.ima3.adPlayer.off("timeupdate", onAdTimeUpdateIma3);
+				me.renderingAd = false; 
+				if (onExitAd) onExitAd(evt);
+                            } catch(e) { me.mPlugin.log(NT.PLUGIN.DEBUG_LEVEL.ERR, e.message); }
+			}
+		}
+		catch(e) {
+			me.mPlugin.log(NT.PLUGIN.DEBUG_LEVEL.ERR, "error in ima3Ad: " + e.message);
+		}
+		};	// End of ima3Ad = function(onExitAd){
+
+		// Default Ad source adapter (for the cases when the right plugin is not detected)
+		function universalAd(onExitAd){
+			try {
+			me.mPlugin.log(NT.PLUGIN.DEBUG_LEVEL.PLAYER, "handling by universalAd");
+                        me.adPaused = false;
+                        me.adPos1Sent = false;
+                        me.adWithinFirstSec = false;
+
+                        var adType;
+			var adTimeout;
+			var mi = {"id": DEFAULT_AD_ID};
+
+			var currPos = me.mPlayer.currentTime();	// No rounding
+			if(me.actualContentLength > 0 && me.actualContentLength-currPos < 0.1)
+				adType = 'postroll';
+			else
+				adType = currPos > 0 ? 'midroll' : 'preroll';
+
+			if (me.mPlayer.ads){
+				me.renderingAd = true; 
+
+				var adData;
+				if (me.mPlayer.ads.ad && me.mPlayer.ads.ad.id){
+					adData = me.mPlayer.ads.ad;
+				} else if (me.mPlayer.ads.pod && me.mPlayer.ads.pod.id){
+					adData = me.mPlayer.ads.pod;
+				}
+				if (adData) {
+					mi.id = adData.id;
+					mi.duration = adData.duration;
+					if (typeof adData.type === "string"){
+						var t = adData.type.toLowerCase();
+						if ( ['preroll','midroll','postroll'].indexOf(t) >= 0 ){
+							adType = t;
+						}
+					}
+				}
+			}
+			me.mPlugin.log(NT.PLUGIN.DEBUG_LEVEL.DEBUG, "[player] adType=" + adType);
+			
+			var adMetadata = getContentMetadata.call(me, mi, adType, me.mPlayer);
+			if (adMetadata) {
+				var ev2 = {"adMetadata": adMetadata};
+				me.mPlugin.playerEventReceived(NT.PLUGIN.PLAYER_EVENT.AD_METADATA_LOADED, ev2);
+				if (me.mPlugin.isAdMetadataCorrect()) {
+					me.mPlugin.playerEventReceived(NT.PLUGIN.PLAYER_EVENT.AD_STARTED, ev2);
+                                        
+                                        function sendingPos1() {
+                                            try {
+                                                me.adWithinFirstSec = false;
+                                                if (me.adPaused || me.adPos1Sent) {
+                                                    return;
+                                                }
+                                                // Value 1 will be used as a base point for diff calculation in the BSDK
+                                                var time = 1;
+                                                if (me.lastAdPosSent < time) {
+                                                    me.mPlugin.log(NT.PLUGIN.DEBUG_LEVEL.PLAYER, "[player][event][ads] (from timer) time=" + time);
+                                                    handleAdOnProgress(time);
+                                                    me.adPos1Sent = true;
+                                                }
+                                                // returning from the timer handler
+                                            } catch(e) {
+                                                me.mPlugin.log(NT.PLUGIN.DEBUG_LEVEL.ERR, e.message);
+                                            }
+                                        }
+                                        // Start the timer
+                                        me.adPos1Sent = false;
+					setTimeout(sendingPos1, 1000);
+                                        me.adWithinFirstSec = true;
+
+					var time = getAdTime(0);
+					me.mPlugin.log(NT.PLUGIN.DEBUG_LEVEL.PLAYER, "[player][event][ads] time=" + time);
+					handleAdOnProgress(time);
+				}
+			} else {
+				return false;
+			}
+
+			function getAdTime(_percent){
+                            try {
+				var percent = typeof _percent === 'undefined' ? 1 : _percent;
+				if(me.mPlayer.ads) {
+					if(me.mPlayer.ads.ad && typeof me.mPlayer.ads.ad.duration === "number") {
+						me.mPlugin.log(NT.PLUGIN.DEBUG_LEVEL.PLAYER, "getAdTime: ad_duration="+me.mPlayer.ads.ad.duration);
+						var currPos = me.mPlayer.ads.ad.duration*percent;
+                                                return currPos;
+					}
+					if(me.mPlayer.ads.pod && me.mPlayer.ads.pod.currentTime) {
+						me.mPlugin.log(NT.PLUGIN.DEBUG_LEVEL.PLAYER, "getAdTime: pod_duration="+me.mPlayer.ads.pod.duration);
+						var currPos = me.mPlayer.ads.pod.currentTime();
+                                                return currPos;
+					}
+				}
+                            } catch(e) {
+                                me.mPlugin.log(NT.PLUGIN.DEBUG_LEVEL.ERR, e.message);
+                                return 0;
+                            }
+			}
+
+			function handleAdOnProgress(timePassed){
+                            try {
+				me.mPlugin.log(NT.PLUGIN.DEBUG_LEVEL.PLAYER, "handleAdOnProgress");
+				if (typeof timePassed !== "undefined"){
+                                    var ev3 = {"position": timePassed}; // sending EXACT position
+                                    me.lastAdPosSent = timePassed;
+                                    me.mPlugin.playerEventReceived(NT.PLUGIN.PLAYER_EVENT.AD_TICK, ev3);
+				}
+                            } catch(e) {
+                                me.mPlugin.log(NT.PLUGIN.DEBUG_LEVEL.ERR, e.message);
+                            }
+			}
+
+// TODO: the following function - onAdTimeUpdateUni() - is not used anymore. It should be removed from the code. 
+			function onAdTimeUpdateUni() {
+                            try {
+				me.mPlugin.log(NT.PLUGIN.DEBUG_LEVEL.PLAYER, "onAdTimeUpdateUni");
+				var time = getAdTime();
+				if (typeof time === "undefined"){
+					me.mPlugin.log(NT.PLUGIN.DEBUG_LEVEL.PLAYER, "(Ad): ERROR - can't get current ad time!");
+					onAdEndedUni();
+					return;
+				}
+				time = me.mPlugin.roundPos(time);
+				handleAdOnProgress(time);
+                            } catch(e) {
+                                me.mPlugin.log(NT.PLUGIN.DEBUG_LEVEL.ERR, e.message);
+                            }
+			}
+
+			function onAdEndedUni(evt) {
+                            try {
+				me.mPlugin.log(NT.PLUGIN.DEBUG_LEVEL.PLAYER, "[player][event][state][ads] ads-ad-ended");
+				var time = getAdTime();
+				me.mPlugin.log(NT.PLUGIN.DEBUG_LEVEL.PLAYER, "[player][event][ads] time=" + time);
+                                me.adPaused = true; // It disables sending the first pos value if ads-ad-ended event occured within the first sec
+				handleAdOnProgress(time);
+                                
+				me.mPlugin.playerEventReceived(NT.PLUGIN.PLAYER_EVENT.AD_STOPPED, null);
+
+				me.mPlayer.off( "ads-ad-ended", onAdEndedUni);
+				me.mPlayer.off( "ads-first-quartile", onFirstQuartile );
+				me.mPlayer.off( "ads-midpoint", onMidpoint );
+				me.mPlayer.off( "ads-third-quartile", onThirdQuartile );
+                                me.mPlayer.off( "ads-pause", onAdsPause );
+                                me.mPlayer.off( "ads-play", onAdsPlay );
+				//window.clearTimeout(adTimeout);
+				me.renderingAd = false; 
+				if (onExitAd) onExitAd(evt);
+                            } catch(e) {
+                                me.mPlugin.log(NT.PLUGIN.DEBUG_LEVEL.ERR, e.message);
+                            }
+			}
+			function onFirstQuartile(evt) {
+                            try {
+				me.mPlugin.log(NT.PLUGIN.DEBUG_LEVEL.PLAYER, "[player][event][ads] ads-first-quartile");
+				var time = getAdTime(.25);
+				me.mPlugin.log(NT.PLUGIN.DEBUG_LEVEL.PLAYER, "[player][event][ads] time=" + time);
+				handleAdOnProgress(time);
+                            } catch(e) {
+                                me.mPlugin.log(NT.PLUGIN.DEBUG_LEVEL.ERR, e.message);
+                            }
+			}
+			function onMidpoint(evt) {
+                            try {
+				me.mPlugin.log(NT.PLUGIN.DEBUG_LEVEL.PLAYER, "[player][event][ads] ads-midpoint");
+				var time = getAdTime(.5);
+				me.mPlugin.log(NT.PLUGIN.DEBUG_LEVEL.PLAYER, "[player][event][ads] time=" + time);
+				handleAdOnProgress(time);
+                            } catch(e) {
+                                me.mPlugin.log(NT.PLUGIN.DEBUG_LEVEL.ERR, e.message);
+                            }
+			}
+			function onThirdQuartile(evt) {
+                            try {
+				me.mPlugin.log(NT.PLUGIN.DEBUG_LEVEL.PLAYER, "[player][event][ads] ads-third-quartile");
+				var time = getAdTime(.75);
+				me.mPlugin.log(NT.PLUGIN.DEBUG_LEVEL.PLAYER, "[player][event][ads] time=" + time);
+				handleAdOnProgress(time);
+                            } catch(e) {
+                                me.mPlugin.log(NT.PLUGIN.DEBUG_LEVEL.ERR, e.message);
+                            }
+			}
+			function onAdsPause(evt) {
+                            try {
+				me.mPlugin.log(NT.PLUGIN.DEBUG_LEVEL.PLAYER, "[player][event][ads] ads-pause");
+                                me.adPaused = true;
+                            } catch(e) {
+                                me.mPlugin.log(NT.PLUGIN.DEBUG_LEVEL.ERR, e.message);
+                            }
+			}
+			function onAdsPlay(evt) {
+                            try {
+				me.mPlugin.log(NT.PLUGIN.DEBUG_LEVEL.PLAYER, "[player][event][ads] ads-play");
+                                me.adPaused = false;
+                                if (!me.adPos1Sent && !me.adWithinFirstSec) {
+                                    var time = 1;
+                                    if (me.lastAdPosSent < time) {
+                                        me.mPlugin.log(NT.PLUGIN.DEBUG_LEVEL.PLAYER, "[player][event][ads] (from ads-play handler) time=" + time);
+                                        handleAdOnProgress(time);
+                                        me.adPos1Sent = true;
+                                    }
+                                }
+                            } catch(e) {
+                                me.mPlugin.log(NT.PLUGIN.DEBUG_LEVEL.ERR, e.message);
+                            }
+			}
+			
+			me.mPlayer.on( "ads-ad-ended", onAdEndedUni );
+			me.mPlayer.on( "ads-first-quartile", onFirstQuartile );
+			me.mPlayer.on( "ads-midpoint", onMidpoint );
+			me.mPlayer.on( "ads-third-quartile", onThirdQuartile );
+			me.mPlayer.on( "ads-pause", onAdsPause );
+			me.mPlayer.on( "ads-play", onAdsPlay );
+			//         onAdTimeUpdateUni();
+			return true;
+			} catch(e) {
+                            me.mPlugin.log(NT.PLUGIN.DEBUG_LEVEL.ERR, e.message);
+                            return false;
+                        }
+		}	// End of universalAd = function(onExitAd){
+		
+		function getContentMetadata (mi, type, player){
+			var me = this;
+			var data = {
+					type:type
+			};
+			try {
+
+			if (!mi) return data;
+			
+			var str = "";
+			// load defaults first
+			this.mPlugin.copyCustomParams(this.cmsDefaults, data);
+
+			if(type == "content")
+			{
+				me.mPlugin.contentId = me.getContentAssetId(mi);
+                                // Note, contentId is NOT going to data.
+                                me.mPlugin.log(NT.PLUGIN.DEBUG_LEVEL.DEBUG, "contentId is set to " + me.mPlugin.contentId);
+				data.assetName = mi.name;
+				data.title = mi.name;
+//				data.nielsen_assetName = mi.name;
+//				data.nielsen_title = mi.name;
+                                if (typeof mi.id !== "undefined")
+                                    data.nielsen_mediaid = mi.id;
+
+//					From the documentation: http://docs.brightcove.com/en/video-cloud/brightcove-player/reference/api/player.html
+//					NOTE: The video must have started loading before the duration can be known,
+//					and in the case of Flash, may not be known until the video starts playing.
+				if (!me.renderingAd) {
+					data.length = me.getActualDuration();
+//                                         data.nielsen_length = data.length;
+				}
+				if (typeof data.length !== 'undefined') {
+					// No need to round the value. We should pass the length as is.
+					me.actualContentLength = data.length;
+					// actualContentLength is the ACTUAL content length returned by the player.
+				}
+				if(typeof me.actualContentLength === 'undefined') me.actualContentLength = 0;
+
+				data.mediaURL = me.mPlayer.currentSrc();
+//                                data.nielsen_mediaURL = data.mediaURL;
+				// custom_fields (or stream_custom_params) are available in currentItem.
+				
+				var cnt = 0;
+				cnt += this.mPlugin.copyCustomParams(this.stream_custom_params, data);
+				cnt += this.mPlugin.copyCustomParams(mi.custom_fields, data);
+				cnt += this.mPlugin.copyCustomParams(mi.stream_custom_params, data);
+				me.mPlugin.customDataProvided = (cnt != 0);
+
+				if (data.mediaURL == null || data.mediaURL == "") {
+					me.mPlugin.log(NT.PLUGIN.DEBUG_LEVEL.ERR, "No mediaURL is provided");
+				}
+/*
+                                if (data.length == null || data.length == 0) {
+					me.mPlugin.log(NT.PLUGIN.DEBUG_LEVEL.ERR, "No content length is provided");
+				}
+*/
+			}
+			else	// the following is for ads
+			{
+				if(player && player.ads) {
+					var adData = null;
+					if (player.ads.ad && player.ads.ad.id){
+						adData = player.ads.ad;
+					} else if (player.ads.pod && player.ads.pod.id){
+						adData = player.ads.pod;
+					}
+					
+					if (adData) {
+						data.assetid = adData.id;
+						data.assetName = data.assetid;
+						data.length = adData.duration;
+					}
+				}
+
+				if (typeof mi.b !== "undefined" || typeof mi.g !== "undefined") { // It's under Android, iOS
+					if (typeof mi.b !== "undefined") {
+						mi = mi.b;	
+					}
+					else if (typeof mi.g !== "undefined") {
+						mi = mi.g;	
+					}
+					
+					data.assetid = mi.adId;	// TODO: maybe not correct, but it's come from V1
+					if (mi.adPodInfo && typeof mi.adPodInfo.totalAds === "number" && typeof mi.adPodInfo.adPosition === "number"
+							&& mi.adPodInfo.totalAds > 0 && mi.adPodInfo.adPosition > 0) {
+						// The position of the first ad == 1 
+						data.assetid += "_" + (mi.adPodInfo.adPosition - 1); 
+					}
+					else {
+						data.assetid = data.assetid + (typeof mi.sequence != "undefined" ? ("_" + mi.sequence) : "");
+					}
+					
+					data.assetName = mi.adId;	// The same as assetid 
+					data.title = mi.title;
+					data.length = mi.duration;
+					data.mediaURL = mi.mediaUrl;
+				}
+				else {
+					if (typeof mi.id != 'undefined') data.assetid = mi.id;
+					if (mi.adPodInfo && typeof mi.adPodInfo.totalAds === "number" && typeof mi.adPodInfo.adPosition === "number"
+							&& mi.adPodInfo.totalAds > 0 && mi.adPodInfo.adPosition > 0) {
+						// The position of the first ad == 1 
+						data.assetid += "_" + (mi.adPodInfo.adPosition - 1); 
+					}
+					else {
+						data.assetid = data.assetid + (typeof mi.sequence != "undefined" ? ("_" + mi.sequence) : "");
+					}
+
+					if (typeof mi.id != 'undefined') data.assetName = mi.id;
+					if (typeof mi.title != 'undefined') data.title = mi.title;
+					if (typeof mi.duration != 'undefined') data.length = mi.duration;
+					if (typeof mi.mediaUrl != 'undefined') data.mediaURL = mi.mediaUrl;
+				}
+			}
+			/*
+			me.mPlugin.log(NT.PLUGIN.DEBUG_LEVEL.DEBUG, "getContentMetadata: type=" + type + "\n"
+					+ "mi=" + NT.PLUGIN.printObject(mi, null, 2) + "\n"
+					+ "data=" + NT.PLUGIN.printObject(data, null, 2)
+					);
+					*/
+			} catch(e) { me.mPlugin.log(NT.PLUGIN.DEBUG_LEVEL.ERR, e.message); }
+			return data;
+		}
+		
+		// TODO: Consider moving the following function to root level, out from the object BcPlugin() or make it an internal function.
+		BcPlugin.prototype.bindCueChangeEvents = function (){
+			try {
+			var textTracks = me.mPlayer.textTracks();
+			if (!textTracks) return;
+			
+			var len = textTracks.length;
+			me.mPlugin.log(NT.PLUGIN.DEBUG_LEVEL.DEBUG, "[id3] bindCueChangeEvents(), tracks.length=" + len);
+			if (typeof textTracks.length !== "number") return;
+
+			for (var i = 0; i < len; i++) {
+				var t = textTracks[i];
+				if (!t) continue;
+				if (t.inBandMetadataTrackDispatchType && me.id3track != t) {
+					me.mPlugin.log(NT.PLUGIN.DEBUG_LEVEL.DEBUG, "[id3] saving textTrack of trackIndex=" + i);
+					me.id3track = t;
+
+					if (t.kind == "metadata") {
+						me.mPlugin.log(NT.PLUGIN.DEBUG_LEVEL.DEBUG, "[id3] setting oncuechange for trackIndex=" + i);
+	
+						t.mode = "hidden";	// Important for MAC - Safari
+	
+						t.addEventListener("cuechange", function() {
+                                                    try {
+							var t1 = this;	// It's a track
+							if (t1.kind == "metadata" && t1.activeCues) {
+								var j;
+								me.mPlugin.log(NT.PLUGIN.DEBUG_LEVEL.PLAYER, "[id3] activeCues.length=" + t1.activeCues.length + (t1.activeCues.length>1 ? " (gt 1)" : ""));
+								if(typeof t1.activeCues[0] === 'undefined')
+								{
+									return;	// It's 'on stop cue'
+								}
+								try {
+									for (j = 0; j < t1.activeCues.length; j++) {
+										var data;
+										data = t1.activeCues[j].value;
+
+										var id3 = null;
+										if (data && data.key && data.key == "PRIV") {
+											var str;
+											if (typeof (data.owner) !== "undefined") str = data.owner;	// It's for Windows
+											else if (typeof (data.info) !== "undefined") str = data.info;	// It's for MAC
+											
+											if (typeof (str) == "string" && str.substr(0,16) == "www.nielsen.com/") {
+												id3 = str;
+											}
+										}
+										
+										if (id3 !== null) {
+											/*
+											 * We should NOT check whether ID3 tags are repeated or not.
+											if (id3 == me.lastId3) {
+												me.mPlugin.log(NT.PLUGIN.DEBUG_LEVEL.PLAYER, "[id3] id3 is repeated: " + id3);
+											}
+											else {
+											*/
+												var ev = {"id3": id3};
+												me.mPlugin.playerEventReceived(NT.PLUGIN.PLAYER_EVENT.META_ID3, ev);
+												me.lastId3 = id3;
+											//}
+										}
+									}
+								}
+								catch(err) {
+									me.mPlugin.log(NT.PLUGIN.DEBUG_LEVEL.ERR, "[id3] error in activeCues: " + err.message);
+								}
+							}
+                                                    }
+                                                    catch(err2) {
+                                                            me.mPlugin.log(NT.PLUGIN.DEBUG_LEVEL.ERR, err2.message);
+                                                    }
+						});	// end of addEventListener
+					}
+				}
+			}	// end of for
+			} catch(e) {
+				me.mPlugin.log(NT.PLUGIN.DEBUG_LEVEL.ERR, e.message);
+			}
+		} // end of BcPlugin.prototype.bindCueChangeEvents
+	} // end of BcPlugin()
+
+        // TODO: getCustomParameter is not used anymore. Remocve it from the code.
+	BcPlugin.prototype.getCustomParameter = function (common, mi, paramName){
+		var me = this;
+		var ret;
+		try {
+		var v;
+		// Both common custom_fields and stream_custom_params are put to "this.stream_custom_params" 
+		v = this.mPlugin._getCustomParameter(common, "stream_custom_params", paramName, IGNORE_CUSTOM_PARAM_CASE);
+		if (typeof v !== 'undefined') ret = v;
+		if (mi) {
+			v = this.mPlugin._getCustomParameter(mi, "custom_fields", paramName, IGNORE_CUSTOM_PARAM_CASE);
+			if (typeof v !== 'undefined') ret = v;
+			v = this.mPlugin._getCustomParameter(mi, "stream_custom_params", paramName, IGNORE_CUSTOM_PARAM_CASE);
+			if (typeof v !== 'undefined') ret = v;
+		}
+		} catch(e) { me.mPlugin.log(NT.PLUGIN.DEBUG_LEVEL.ERR, e.message); }
+		return ret;
+	}
+	
+	BcPlugin.prototype.getContentAssetId = function (mi){
+		var me = this;
+		var assetid = null;
+		try {
+		var v;
+		if (mi) {
+//                        me.mPlugin.log(NT.PLUGIN.DEBUG_LEVEL.DEBUG, "in getContentAssetId(): mi.id=" + mi.id + ", mi.sequence=" + mi.sequence);
+			var seq = typeof mi.sequence != "undefined" ?  ("_" + mi.sequence) : "";
+			if(typeof mi.id != 'undefined') assetid = mi.id + seq;
+		}
+
+		// In case of id is not in mediainfo
+		// we will try to use URL to detect a stream change.
+		// TODO: Consider this way as a primary one for the future release.
+		var curSrc = me.mPlayer.currentSrc();
+//                me.mPlugin.log(NT.PLUGIN.DEBUG_LEVEL.DEBUG, "in getContentAssetId(): currentSrc()=" + NT.PLUGIN.printObject(curSrc));
+		if (assetid == null) {
+			assetid = curSrc;
+		}
+
+		} catch(e) { me.mPlugin.log(NT.PLUGIN.DEBUG_LEVEL.ERR, e.message); }
+		return assetid;
+	}
+/*	
+	BcPlugin.prototype.getCustomDuration = function (mi, duration) {
+		var v = this.getCustomParameter(this, mi, "length");
+		if (typeof v !== 'undefined') duration = v;
+
+		return duration;
+	}
+*/
+	BcPlugin.prototype.getDuration = function () {
+		// actualContentLength value has been set to content length returned from the player
+		return this.actualContentLength;
+	}
+
+	BcPlugin.prototype.getActualDuration = function () {
+		var me = this;
+		var duration = 0;
+		try {
+		var d = this.mPlayer.duration();
+		
+		if (PLAYER_ISSUE_ZERO_DURATION) {
+			if (d == 0)
+				duration = Infinity;
+		}
+
+		if (d == Infinity)
+			duration = NT.PLUGIN.INFINITY_VALUE;
+		else
+			duration = d;
+		
+		if (typeof d !== "number" && d !== Infinity) {
+			this.mPlugin.log(NT.PLUGIN.DEBUG_LEVEL.ERR, "Duration value returned by the player is not a valid number: " + d);
+			duration = 0;
+		}
+
+		if (duration > NT.PLUGIN.INFINITY_VALUE) {
+			this.mPlugin.log(NT.PLUGIN.DEBUG_LEVEL.ERR, "Duration value returned by the player is greater than " + NT.PLUGIN.INFINITY_VALUE);
+		}
+
+		} catch(e) { me.mPlugin.log(NT.PLUGIN.DEBUG_LEVEL.ERR, e.message); }
+		return duration;
+	}
+	
+	// This function returns an exact time position (not rounded)
+	// Rounding can be done in PluginModule if necessary
+	BcPlugin.prototype.getCurrentPlayerPos = function () {
+		var me = this;
+		try {
+		var t = null;
+		var res = {};
+		/*
+		 * Duration can be taken incorrectly at first due to the player issue.
+		 * In FLASH version duration is set to the correct value after the contents starts playing (not in loadedmetadata event)
+		 * That's why we need to get it at every timeupdate event.
+		 */
+		var duration = me.getActualDuration();
+		
+		if(typeof duration === "undefined") {
+			me.videoType = NT.PLUGIN.VIDEO_TYPE.UNKNOWN;
+		}
+		else if (duration === NT.PLUGIN.INFINITY_VALUE) {
+			if (me.videoType !== NT.PLUGIN.VIDEO_TYPE.LIVE) {
+				me.videoType = NT.PLUGIN.VIDEO_TYPE.LIVE;
+				me.actualContentLength = NT.PLUGIN.INFINITY_VALUE;
+				// actualContentLength is the ACTUAL content length returned by the player.
+
+//				var duration = this.getCustomDuration(me.mPlayer.mediainfo, me.actualContentLength);
+				
+//				var ev = {"contentMetadata": {"length" : duration, "nielsen_length" : duration} };
+				var ev = {"contentMetadata": {"length" : duration} };
+				me.mPlugin.playerEventReceived(NT.PLUGIN.PLAYER_EVENT.METADATA_LOADED, ev);
+			}
+		}
+		else {
+			if (me.videoType !== NT.PLUGIN.VIDEO_TYPE.VOD) {
+				me.videoType = NT.PLUGIN.VIDEO_TYPE.VOD;
+			}
+			if (me.actualContentLength != duration) {
+				me.actualContentLength = duration;
+				// actualContentLength is the ACTUAL content length returned by the player.
+	
+//				var duration = this.getCustomDuration(me.mPlayer.mediainfo, me.actualContentLength);
+	
+				var ev = {"contentMetadata": {"length" : duration} };
+				me.mPlugin.playerEventReceived(NT.PLUGIN.PLAYER_EVENT.METADATA_LOADED, ev);
+			}
+		}
+
+		var ct = me.mPlayer.currentTime();
+		if (ct !== me.lastCurrentTime) {
+			/*
+			 * We need to check whether the time returned by currentTime() is changed since the previous timeupdate event.
+			 * If it's the same it might be the sign of the stream being stalled.
+			 * This is the BC suggestion. Case #373202.   
+			 */
+			me.lastCurrentTime = ct;
+			if (me.videoType === NT.PLUGIN.VIDEO_TYPE.LIVE) {
+				t = Date.now() / 1000;
+			}
+			else {
+				t = ct;
+			}
+		}
+		
+		if(t)
+			me.tickCount++;
+
+		res["duration"] = me.actualContentLength;
+		res["stream_position"] = ct;
+		res["position"] = t;
+		return res;
+		} catch(e) {
+                    me.mPlugin.log(NT.PLUGIN.DEBUG_LEVEL.ERR, e.message);
+                    return null;
+                }
+	}
+
+	function pluginHandler(params)
+	{
+            // This function will be called for all players created on the page 
+            try {
+		var mPlayer = this;
+		var p = new BcPlugin(mPlayer, params);
+		sBcPlugin.push(p);
+            } catch(e) {
+            }
+            return this; // allow chaining calls to the player
+	}	// End of pluginHandler()
+
+	videojs.plugin('NielsenBC', pluginHandler );
+
+	return {
+		bc_plugin: sBcPlugin,
+		qunit: {
+			BcPlugin: BcPlugin
+		},
+		adPluginVersion: adPluginVersion
+	};
+})();	// NT.BC_PLUGIN
+/**
+App SDK Plugin
+Copyright (C) 2016, The Nielsen Company (US) LLC. All Rights Reserved.
+ *
+Software contains the Confidential Information of Nielsen and is subject to your relevant agreements with Nielsen.
+ */
+
+var NT = NT || {};
+
+NT.PLUGIN = (function(){
+
+	/*
+	 * The following code is supposed to be player independent.
+	 * It'd be good to have it in a separate file. But unfortunately several files are not supported in some player's sites.
+	 * If I specify two files as a plugin code, it doesn't work for some reason.
+	 * That's why we have to combine base plugin code and player specific code into one file.
+	 * We use build.bat file for that. 
+	 */	
+
+	/*
+	 * Yeng Yang, mail from Aug, 10
+	 * Event 35 uses the same ggPM() API. Usage of the event call is as follows.
+
+	Description: 
+	This event provides the ability to update the metadata fields that were initialized during events 3/15.
+	All metadata fields used during events 3/15 should be supported except type/vidtype.
+	Currently this event will not allow the change of content type.
+	Content type changes should use events 3/15.
+
+	Usage: instance.ggPM(35, <metadataObject>);
+	Sample: instance.ggPM(35, { length: 250 });
+
+	In your specific issue with the plugin,
+	event 35 should be called right after event the event 15 of when you have the content length.
+	 */	
+
+        var DEBUG_VERSION = false;
+	var BASE_PLUGIN_NAME = "Base Plugin";
+	var BASE_PLUGIN_VERSION = "1.0_bc (still having BC specific code)";	// The last internal version is ""
+
+	var CONT_MIN_LENGTH = 5;
+	var PLAYER_NEAR_END = 0.2;	// If the current playhead position is closer to the end than this value, we think it's the end of the stream
+	var NEAR_TIME_UPDATES_MAX = 0.3; // If the difference between two near time updates is less than this value, it's the same stream.
+
+	var INFINITY_VALUE = 86400;
+	
+	var VIDEO_TYPE = {
+			UNKNOWN: 0,
+			VOD: 1,
+			LIVE: 2
+	};
+
+	var PLAYER_EVENT = {
+			IDLE: 0,
+			AD_STARTED: 1,
+			AD_PAUSED: 2,
+			AD_STOPPED: 3,
+			AD_TICK: 4,
+			CONT_STARTED: 5,
+			CONT_PAUSED: 6,
+			CONT_STOPPED: 7,
+			CONT_TICK: 8,
+			CONT_ENDED: 9,
+			PLAYLIST_ITEM_CHANGED: 10,
+			METADATA_LOADED: 11,
+			AD_METADATA_LOADED: 12,
+			META_ID3: 13
+	};
+
+	var EVENT = {
+			NONE: { name: "none", num: "0" },
+			LOAD_METADATA_3: { name: "loadMetadata", num: "3" },
+			PLAY_5: { name: "play", num: "5" },
+			LOAD_AND_PLAY_15: { name: "15", num: "15" },
+			UPDATE_LENGTH_35: { name: "35", num: "35" },
+			TICK_49: { name: "setPlayheadPosition", num: "49" },
+			STOP_7: { name: "stop", num: "7" },
+			ID3_55: { name: "sendID3", num: "55" },
+			END_57: { name: "end", num: "57" },
+			STATIC_14: { name: "staticStart", num: "14" }
+	};
+
+	//////////////////////////////////
+	var CMB_FILENAME_510 = "ggcmb510.js";
+	var cmbFileName = CMB_FILENAME_510;
+
+	var _nextInstance = Math.round(Math.random() * 10000)*10000;
+//	var addrProtocol = window.location.protocol || "http:";
+	var addrProtocol = window.location.protocol.indexOf("https")==0 ? "https:" : "http:";
+	var coreTag, initQueue = [];
+
+	var DEBUG_LEVEL = {
+			NO : { name:"false", level:0 },
+			ERR : { name:"error", level:1 },
+			WARNING : { name:"warning", level:2 },
+			PLAYER : { name:"player", level:3 },
+			PLUGIN : { name:"plugin", level:4 },
+			DEBUG : { name:"debug", level:5 },
+			XML : { name:"xml", level:6 },
+			ALL : { name:"all", level:7 },
+			MAX : { name:"max", level:9 }
+	};
+
+	var PREFIX = "PLUGIN: "; 
+
+	function setPrefix(ev)
+	{
+		var str = "SDKEvent '" + ev.name + "(" + ev.num + ")', ";
+		return str;
+	}
+
+	function printObject(obj, par1, par2) {
+		
+		function censor(key, value) {
+			  if (value == Infinity) {
+			    return "#Infinity";
+			  }
+			  return value;
+			}
+		
+		try {
+			if (/*typeof par1 !== 'undefined' && */ typeof par2 !== 'undefined')
+				return JSON.stringify(obj, censor, par2);
+			else
+				return JSON.stringify(obj, censor);
+		}
+		catch(e) {
+			return "ERROR in JSON.stringify: " + e.message;
+//			me.mPlugin.log(NT.PLUGIN.DEBUG_LEVEL.ERR, "ERROR in JSON.stringify: " + e.message);  
+		}
+	}
+        
+    function cloneObj(arg) {
+        if (arg != null && typeof arg === 'object') {
+            try {
+                return JSON.parse(JSON.stringify(arg));
+            }
+            catch(e) {
+                return arg; // In case of error, the original object is rerurned instead of clonned one. It's better than nothing.
+            }
+        }
+        return arg;
+    };
+
+    function merge_objects(obj1, obj2) {
+            var obj3 = {};
+            try {
+                if (typeof obj1 === "object" && obj1 !== null) {
+                    for ( var attrname in obj1) {
+                            if (typeof obj1[attrname] != 'undefined') obj3[attrname] = obj1[attrname];
+                    }
+                }
+                if (typeof obj2 === "object" && obj2 !== null) {
+                    for ( var attrname in obj2) {
+                            if (typeof obj2[attrname] != 'undefined') obj3[attrname] = obj2[attrname];
+                    }
+                }
+            }
+            catch(e) {
+            }
+            return obj3;
+	}
+
+	function getOSinfo() {
+            try {
+                var unknown = 'Unknown';
+		// screen
+		var screenSize = '';
+		if (screen.width) {
+			width = (screen.width) ? screen.width : '';
+			height = (screen.height) ? screen.height : '';
+			screenSize += '' + width + " x " + height;
+		}
+
+		//browser
+		var nVer = navigator.appVersion;
+		var nAgt = navigator.userAgent;
+		var browser = navigator.appName;
+		var version = '' + parseFloat(navigator.appVersion);
+		var majorVersion = parseInt(navigator.appVersion, 10);
+		var nameOffset, verOffset, ix;
+
+		// Opera
+		if ((verOffset = nAgt.indexOf('Opera')) != -1) {
+			browser = 'Opera';
+			version = nAgt.substring(verOffset + 6);
+			if ((verOffset = nAgt.indexOf('Version')) != -1) {
+				version = nAgt.substring(verOffset + 8);
+			}
+		}
+		// MSIE
+		else if ((verOffset = nAgt.indexOf('MSIE')) != -1) {
+			browser = 'Microsoft Internet Explorer';
+			version = nAgt.substring(verOffset + 5);
+		}
+
+		//IE 11 no longer identifies itself as MS IE, so trap it
+		//http://stackoverflow.com/questions/17907445/how-to-detect-ie11
+		else if ((browser == 'Netscape') && (nAgt.indexOf('Trident/') != -1)) {
+
+			browser = 'Microsoft Internet Explorer';
+			version = nAgt.substring(verOffset + 5);
+			if ((verOffset = nAgt.indexOf('rv:')) != -1) {
+				version = nAgt.substring(verOffset + 3);
+			}
+
+		}
+
+		// Chrome
+		else if ((verOffset = nAgt.indexOf('Chrome')) != -1) {
+			browser = 'Chrome';
+			version = nAgt.substring(verOffset + 7);
+		}
+		// Safari
+		else if ((verOffset = nAgt.indexOf('Safari')) != -1) {
+			browser = 'Safari';
+			version = nAgt.substring(verOffset + 7);
+			if ((verOffset = nAgt.indexOf('Version')) != -1) {
+				version = nAgt.substring(verOffset + 8);
+			}
+
+			// Chrome on iPad identifies itself as Safari. Actual results do not match what Google claims
+			//  at: https://developers.google.com/chrome/mobile/docs/user-agent?hl=ja
+			//  No mention of chrome in the user agent string. However it does mention CriOS, which presumably
+			//  can be keyed on to detect it.
+			if (nAgt.indexOf('CriOS') != -1) {
+				//Chrome on iPad spoofing Safari...correct it.
+				browser = 'Chrome';
+				//Don't believe there is a way to grab the accurate version number, so leaving that for now.
+			}
+		}
+		// Firefox
+		else if ((verOffset = nAgt.indexOf('Firefox')) != -1) {
+			browser = 'Firefox';
+			version = nAgt.substring(verOffset + 8);
+		}
+		// Other browsers
+		else if ((nameOffset = nAgt.lastIndexOf(' ') + 1) < (verOffset = nAgt.lastIndexOf('/'))) {
+			browser = nAgt.substring(nameOffset, verOffset);
+			version = nAgt.substring(verOffset + 1);
+			if (browser.toLowerCase() == browser.toUpperCase()) {
+				browser = navigator.appName;
+			}
+		}
+		// trim the version string
+		if ((ix = version.indexOf(';')) != -1) version = version.substring(0, ix);
+		if ((ix = version.indexOf(' ')) != -1) version = version.substring(0, ix);
+		if ((ix = version.indexOf(')')) != -1) version = version.substring(0, ix);
+
+		majorVersion = parseInt('' + version, 10);
+		if (isNaN(majorVersion)) {
+			version = '' + parseFloat(navigator.appVersion);
+			majorVersion = parseInt(navigator.appVersion, 10);
+		}
+
+		// mobile version
+		var mobile = /Mobile|mini|Fennec|Android|iP(ad|od|hone)/.test(nVer);
+
+		// cookie
+		var cookieEnabled = (navigator.cookieEnabled) ? true : false;
+
+		if (typeof navigator.cookieEnabled == 'undefined' && !cookieEnabled) {
+			document.cookie = 'testcookie';
+			cookieEnabled = (document.cookie.indexOf('testcookie') != -1) ? true : false;
+		}
+
+		// system
+		var os = unknown;
+		var clientStrings = [
+		                     {s:'Windows 3.11', r:/Win16/},
+		                     {s:'Windows 95', r:/(Windows 95|Win95|Windows_95)/},
+		                     {s:'Windows ME', r:/(Win 9x 4.90|Windows ME)/},
+		                     {s:'Windows 98', r:/(Windows 98|Win98)/},
+		                     {s:'Windows CE', r:/Windows CE/},
+		                     {s:'Windows 2000', r:/(Windows NT 5.0|Windows 2000)/},
+		                     {s:'Windows XP', r:/(Windows NT 5.1|Windows XP)/},
+		                     {s:'Windows Server 2003', r:/Windows NT 5.2/},
+		                     {s:'Windows Vista', r:/Windows NT 6.0/},
+		                     {s:'Windows 7', r:/(Windows 7|Windows NT 6.1)/},
+		                     {s:'Windows 8.1', r:/(Windows 8.1|Windows NT 6.3)/},
+		                     {s:'Windows 8', r:/(Windows 8|Windows NT 6.2)/},
+		                     {s:'Windows 10', r:/(Windows 10|Windows NT 10.0)/},
+		                     {s:'Windows NT 4.0', r:/(Windows NT 4.0|WinNT4.0|WinNT|Windows NT)/},
+		                     {s:'Windows ME', r:/Windows ME/},
+		                     {s:'Android', r:/Android/},
+		                     {s:'Open BSD', r:/OpenBSD/},
+		                     {s:'Sun OS', r:/SunOS/},
+		                     {s:'Linux', r:/(Linux|X11)/},
+		                     {s:'iOS', r:/(iPhone|iPad|iPod)/},
+		                     {s:'Mac OS X', r:/Mac OS X/},
+		                     {s:'Mac OS', r:/(MacPPC|MacIntel|Mac_PowerPC|Macintosh)/},
+		                     {s:'QNX', r:/QNX/},
+		                     {s:'UNIX', r:/UNIX/},
+		                     {s:'BeOS', r:/BeOS/},
+		                     {s:'OS/2', r:/OS\/2/},
+		                     {s:'Search Bot', r:/(nuhk|Googlebot|Yammybot|Openbot|Slurp|MSNBot|Ask Jeeves\/Teoma|ia_archiver)/}
+		                     ];
+		for (var id in clientStrings) {
+			var cs = clientStrings[id];
+			if (cs.r.test(nAgt)) {
+				os = cs.s;
+				break;
+			}
+		}
+
+		var osVersion = unknown;
+
+		if (/Windows/.test(os)) {
+			osVersion = /Windows (.*)/.exec(os)[1];
+			os = 'Windows';
+		}
+
+		switch (os) {
+		case 'Mac OS X':
+			osVersion = /Mac OS X (10[\.\_\d]+)/.exec(nAgt)[1];
+			break;
+
+		case 'Android':
+			osVersion = /Android ([\.\_\d]+)/.exec(nAgt)[1];
+			break;
+
+		case 'iOS':
+			osVersion = /OS (\d+)_(\d+)_?(\d+)?/.exec(nVer);
+			osVersion = osVersion[1] + '.' + osVersion[2] + '.' + (osVersion[3] | 0);
+			break;
+
+		}
+
+		return {
+			screen: screenSize,
+			browser: browser,
+			browserVersion: version,
+			mobile: mobile,
+			os: os,
+			osVersion: osVersion,
+			cookies: cookieEnabled
+		};
+            }
+            catch(e) {
+                return {};
+            }
+	}
+
+	function PluginModule(ldrparams, plugin, options)
+	{
+            try {
+		function getBrowserVersion() {
+                    try {
+			return navigator.userAgent;
+                    } catch(e) {}
+                    return "";
+		}		
+
+		this.startTime = Date.now();
+
+		this.gg = null;
+		this.ldrparams = ldrparams;
+		this.plugin = plugin;
+		this.options = options;
+
+		// For logging:
+		this.debug = false;
+		// Need to enable log for first steps while reading ldparams.
+		if (window.logfile) this.debug = window.logfile;
+		else if (window.console) this.debug = window.console;
+
+		this.lastLogString = "";
+		this.nLogString = 0;
+
+		var debugLevelName = "";
+		if (this.ldrparams.hasOwnProperty("nol_pluginDebug")) {
+			debugLevelName = this.ldrparams.nol_pluginDebug;
+                        // Don't delete ldrparams. It will be printed out later, and after that it will be deleted
+		}
+		debugLevelName = String(debugLevelName).toLowerCase();
+
+                if (DEBUG_VERSION) {
+                    debugLevelName = "all";
+                }
+
+		if (debugLevelName == "plugin") this.debugLevel = DEBUG_LEVEL.PLUGIN;
+		else if (debugLevelName == "false") this.debugLevel = DEBUG_LEVEL.NO;
+		else if (debugLevelName == "player") this.debugLevel = DEBUG_LEVEL.PLAYER;
+		else if (debugLevelName == "debug" || debugLevelName == "true") this.debugLevel = DEBUG_LEVEL.DEBUG;
+		else if (debugLevelName == "xml") this.debugLevel = DEBUG_LEVEL.XML;
+		else if (debugLevelName == "all") this.debugLevel = DEBUG_LEVEL.ALL;
+		else if (debugLevelName == "warning") this.debugLevel = DEBUG_LEVEL.WARNING;
+		else if (debugLevelName == "error") this.debugLevel = DEBUG_LEVEL.ERR;
+		else this.debugLevel = DEBUG_LEVEL.NO;	// Default value.
+                
+                if (DEBUG_VERSION) {
+                    this.log(DEBUG_LEVEL.PLUGIN, "DEBUG VERSION");
+                }
+
+                this.log(DEBUG_LEVEL.PLUGIN, "ldrparams=" + printObject(this.ldrparams, null, 2));
+		if (this.ldrparams.hasOwnProperty("nol_pluginDebug")) {
+			delete this.ldrparams.nol_pluginDebug;
+		}
+
+		var browser = getBrowserVersion();
+		var platformInfo = getOSinfo();
+
+		this.log(DEBUG_LEVEL.PLUGIN, "browser info=" + browser);
+
+		this.log(DEBUG_LEVEL.PLUGIN, "OS: " + platformInfo.os +' '+ platformInfo.osVersion);
+		this.log(DEBUG_LEVEL.PLUGIN, "Browser: " + platformInfo.browser +' '+ platformInfo.browserVersion);
+		this.log(DEBUG_LEVEL.PLUGIN, "Mobile: " + platformInfo.mobile);
+		this.log(DEBUG_LEVEL.PLUGIN, "Cookies: " + platformInfo.cookies);
+		this.log(DEBUG_LEVEL.PLUGIN, "Screen Size: " + platformInfo.screen);
+		
+		this.isCreateXML = (typeof XmlLog !== 'undefined') && this.isInLog(DEBUG_LEVEL.XML);
+
+                this.xmlLog = null;
+                try {
+                    if (this.isCreateXML) {
+                            var title = Date.now();
+                            this.xmlLog = new XmlLog(this, this.ldrparams, title);
+                    }
+                } catch(e) {}
+
+		// initialization
+		this.sessionCount = 0;
+		this.noPostrolls = 0;
+
+		this.lastAdAssetId = 0;
+		this.lastAssetId = 0;
+		this.lastAdPosition = -1;
+                this.lastAdExactPosition = -1;
+		this.lastPlayerPos = -1;
+		this.lastPlayerPosExact = -1;
+
+		this.arAdTime = [];
+		this.arContTime = [];
+		this.arId3 = [];
+
+		this.adBlockOpened = false;
+		this.contBlockOpened = false;
+		this.entireContentOpened = false;
+		this.sessionOpened = false;
+
+		this.ignoreNextEndedEvent = false;
+
+		this.contentMetadata = null;
+		this.contentMetadataForOpenedSession = null;
+		this.lastContentLengthSentToSDK = null;
+		this.adMetadata = null;
+
+		this.contentId = null;
+		this.contentIdForOpenedSession = null;
+		
+		this.customDataProvided = false;
+
+		this.loadBeacon(this.initPlugin);
+            }
+            catch(e) {
+            }
+	}
+
+	PluginModule.prototype.saveXml = function() {
+            try {
+		return this.xmlLog ? this.xmlLog.saveXml() : null;
+            }
+            catch(e) {
+            }
+	}
+
+	PluginModule.prototype.isInLog = function(level) {
+		return (level.level <= this.debugLevel.level);
+	}
+
+	PluginModule.prototype.log = function (level, obj) {
+            try {
+		if (typeof this.debug === "object" && this.debug !== null && level.level <= this.debugLevel.level) {
+			if(this.lastLogString == obj) this.nLogString++;
+			else this.nLogString = 0;
+
+			/*
+					var pluginInstanceName = this.getGG() ? this.getGG().GetName() : "SDK is not ready";
+					this.debug.log((this.nLogString != 0 ? (this.nLogString+" ") : "") + PREFIX + pluginInstanceName + ": " + obj);
+			 */
+			var time = Date.now();
+			var delta = Math.round( (time - this.startTime) / 1000 );
+			var messageType = "";
+			if (level == DEBUG_LEVEL.ERR) {
+				messageType = "ERROR: ";
+			}
+			if (level == DEBUG_LEVEL.WARNING) {
+				messageType = "WARNING: ";
+			}
+			this.debug.log((this.nLogString != 0 ? (this.nLogString+" ") : "") + PREFIX + delta + "s, " + time + ": " + messageType + obj);
+			this.lastLogString = obj;
+		}
+            }
+            catch(e) {}
+	}
+	
+	PluginModule.prototype._getCustomParameter = function (obj, customName, paramName, ignoreCase){
+            var par;
+            try {
+		if (!obj || !obj.hasOwnProperty(customName) || !customName || !paramName)
+			return par;
+		var cfs = obj[customName];
+		var nm = paramName;
+		if (ignoreCase) {
+			var paramLow = paramName.toLowerCase();
+			for(i in cfs) {
+				if (paramLow == i.toLowerCase()) {
+					nm = i;
+					break;
+					// If we have not been here, nm is still equal to paramName.  
+				}
+			}
+		}
+		par = cfs[nm];
+		
+		par = this.verifyParam(paramName, par);
+            } catch(e) {}
+            return par;
+	}
+	
+	PluginModule.prototype.verifyParam = function (paramName, par) {
+		var ret;
+		if (typeof paramName !== 'undefined' && typeof par !== 'undefined') {
+			ret = par;
+		}
+		return ret;
+	}
+	
+	PluginModule.prototype.copyCustomParams = function (custom, out) {
+            var cnt = 0;
+            try {
+		if (typeof custom === "object" && custom !== null && typeof out === "object" && out !== null) {
+        		this.log(NT.PLUGIN.DEBUG_LEVEL.DEBUG, "custom data=" + printObject(custom));
+			for (i in custom) {
+				if (custom.hasOwnProperty(i)){
+					par = this.verifyParam(i, custom[i]);
+					if (typeof par !== 'undefined') {
+						out[i] = par;
+						cnt++;
+					}
+				}
+			}
+		}
+            } catch(e) {}
+            return cnt;
+	}
+
+	
+	PluginModule.prototype.loadBeacon = function(onload){
+		var that = this;
+            try {
+		this.log(NT.PLUGIN.DEBUG_LEVEL.PLUGIN, "info: Plugin=" + BASE_PLUGIN_NAME + " " + BASE_PLUGIN_VERSION);
+
+		if (window.NOLCMB) {
+			if(onload) onload.call(that);
+			return;
+		}
+		if(onload) initQueue.push(onload);
+		if (!coreTag){
+			coreTag = document.createElement("script");
+			coreTag.type = "text/javascript";
+
+			var ggFailCount = 0;
+			function initBeacon(){
+				if(!window.NOLCMB) {
+					if(ggFailCount < 10) {
+						setTimeout(initBeacon, 500);
+					}
+					// TODO: improve logging functionality. Use "that" variable instead of "this".
+					// TODO: Add "else" block
+					ggFailCount++;
+					return;
+				}
+
+				// TODO: improve logging functionality. Use "that" variable instead of "this".
+//				if (window.console) window.console.log("info: ggFailCount=" + ggFailCount);
+
+				var i;
+				for (i = 0; i < initQueue.length; i++) {
+					initQueue[i].call(that);
+				}
+				initQueue = [];
+			}
+
+			coreTag.onerror = function() {
+				// TODO: improve logging functionality. Use "that" variable instead of "this".
+//				if (window.console) window.console.log("Error in loading CMB file: " + coreTag.src);
+			}
+
+			coreTag.onload = function() {
+				ggFailCount = 0;
+				initBeacon();
+			};
+
+			var path;
+			if(this.options.hasOwnProperty("cmbPath")) {
+				path = this.options["cmbPath"];
+			}
+			else {
+				var cdnPrefix = window.location.protocol === "https:" ? "//sec" : "//";
+				var cdnDomain = (this.ldrparams.hasOwnProperty('cdnDomain') && this.ldrparams.cdnDomain.length > 0) ? this.ldrparams.cdnDomain : "cdn-gl";
+				path = addrProtocol +  cdnPrefix + cdnDomain + ".imrworldwide.com/novms/js/2/" + cmbFileName;
+			}
+			this.log(DEBUG_LEVEL.PLUGIN, "info: cmb path=" + path);
+			coreTag.src = path;
+			document.head.appendChild(coreTag);
+		}
+            } catch(e) {}
+	}	// End of loadBeacon
+
+	PluginModule.prototype.getGG = function(){
+		return this.gg;
+	}
+
+	PluginModule.prototype.sendEventToSDK = function(ev, obj){
+            try {
+		if (this.getGG()) {
+                    var cp = cloneObj(obj);
+                    this.getGG().ggPM(ev.name, cp);
+                }
+            } catch(e) {
+		this.log(DEBUG_LEVEL.ERR, "SDK: " + e.message);
+            }
+            try {
+		if (this.isCreateXML) {
+			this.xmlLog.addMsg(ev.num, obj);
+		}
+            } catch(e) {
+		this.log(DEBUG_LEVEL.ERR, e.message);
+            }
+	}
+
+	PluginModule.prototype.initPlugin = function () {
+		try {
+			this.gg = window.NOLCMB.getInstance(_nextInstance.toString());
+			this.gg.ggInitialize(this.ldrparams);
+			_nextInstance++;
+		}
+		catch(e) {
+                        this.gg = null;
+			this.log(DEBUG_LEVEL.ERR, "Error in loading SDK: " + e.message);
+		}
+	}
+	
+	PluginModule.prototype.sendId3FromArray = function () {
+		var i;
+		for(i = 0; i < this.arId3.length; i++)
+		{
+			if (this.isInLog(DEBUG_LEVEL.PLUGIN)) {
+				var str = setPrefix(EVENT.ID3_55) + "[id3] (from array) id3=" + printObject(this.arId3[i]);
+				this.log(DEBUG_LEVEL.PLUGIN, str);
+			}
+			this.sendEventToSDK(EVENT.ID3_55, this.arId3[i]);
+		}
+		this.arId3 = [];
+	}
+
+	PluginModule.prototype.saveId3ToArray = function (obj) {
+		if (this.isInLog(DEBUG_LEVEL.PLUGIN)) {
+                    var str = setPrefix(EVENT.ID3_55) + "[id3] (push to array) id3=" + printObject(obj);
+            	    this.log(DEBUG_LEVEL.PLUGIN, str);
+                }
+		this.arId3.push(obj);
+	}
+
+	PluginModule.prototype.sendEvent = function (ev, obj)
+	{
+		var str = "";
+		if (this.isInLog(DEBUG_LEVEL.PLUGIN))
+		{
+			str = setPrefix(ev);
+			switch(ev)
+			{
+			case EVENT.LOAD_METADATA_3:
+			case EVENT.LOAD_AND_PLAY_15:
+				str += "metadata=" + printObject(obj);
+				break;
+			case EVENT.UPDATE_LENGTH_35:
+				str += "length to update=" + printObject(obj);
+				break;
+			case EVENT.ID3_55:
+				break;
+			case EVENT.PLAY_5:
+			case EVENT.TICK_49:
+			case EVENT.STOP_7:
+			case EVENT.END_57:
+				str += "pos=" + printObject(obj);
+				break;
+			case EVENT.STATIC_14:
+				// TODO: What parameter should be here?
+				break;
+			}
+		}
+
+		if (ev !== EVENT.ID3_55)
+		{
+			this.log(DEBUG_LEVEL.PLUGIN, str);
+			this.sendEventToSDK(ev, obj);
+		}
+
+		switch(ev)
+		{
+		case EVENT.LOAD_METADATA_3:
+			this.arId3 = [];
+			break;
+		case EVENT.LOAD_AND_PLAY_15:
+			break;
+		case EVENT.ID3_55:
+			if (!this.plugin.renderingAd)
+			{
+				this.sendId3FromArray();
+
+				if (this.isInLog(DEBUG_LEVEL.PLUGIN)) str = setPrefix(ev) + "[id3] =" + printObject(obj);
+				this.log(DEBUG_LEVEL.PLUGIN, str);
+				this.sendEventToSDK(ev, obj);
+			}
+			else
+			{
+				this.saveId3ToArray(obj);
+			}
+			break;
+		case EVENT.PLAY_5:
+			break;
+		case EVENT.TICK_49:
+			break;
+		case EVENT.STOP_7:
+//			this.arId3 = [];
+			break;
+		case EVENT.END_57:
+			this.arId3 = [];
+			break;
+		case EVENT.STATIC_14:
+			// TODO: What parameter should be here?
+			break;
+		}
+
+	}
+
+	PluginModule.prototype.doOpenEntireContent = function ()
+	{
+		if (!this.contentMetadata) {
+			this.log(DEBUG_LEVEL.PLUGIN, "ERROR: no this.contentMetadata");
+			return;
+		}
+
+		var contMeta = this.contentMetadata;
+
+		this.log(DEBUG_LEVEL.PLUGIN, "New session: " + this.sessionCount);
+		this.sendEvent(EVENT.LOAD_METADATA_3, contMeta);
+		this.sessionOpened = true;
+		this.entireContentOpened = true;
+//		this.lastAssetId = contMeta.assetid;
+		this.lastAssetId = this.contentId;
+		this.lastPlayerPos = -1; // reset the position as it's a different video or re-playing from the beginning
+		this.lastPlayerPosExact = -1;
+		this.noPostrolls = 0;
+		this.lastContentLengthSentToSDK = this.contentMetadata.length;
+		this.contentMetadataForOpenedSession = contMeta;
+		this.contentIdForOpenedSession = this.contentId;
+		this.contentMetadata = null;
+		this.contentId = null;
+
+		this.sessionCount++;	// It is set to 0 in the constructor
+	}
+
+	PluginModule.prototype.doOpenAdBlock = function ()
+	{
+		if (!this.adMetadata) {
+			this.log(DEBUG_LEVEL.PLUGIN, "ERROR: no this.adMetadata");
+			return;
+		}
+
+		// Assert: this.adBlockOpened === false
+		if (this.adBlockOpened) {
+			this.log(DEBUG_LEVEL.PLUGIN, "ERROR: adBlockOpened == true");
+			return;
+		}
+
+/* 
+ * Incorrect for pure id3 tagged stream. No session is opened, but we can receive postrolls. 
+		if (this.adMetadata.type == "postroll" && this.sessionCount === 0) {
+			this.log(DEBUG_LEVEL.PLUGIN, "ERROR: no session, but postroll received");
+			return;
+		}
+ */
+
+		if (this.adMetadata.type == "postroll") {
+			this.noPostrolls++;
+		}
+		else {
+			// Open EntireContent for an Ad other than a postroll
+//			if (!this.entireContentOpened && this.contentMetadata && this.contentMetadata.assetid) {
+			if (!this.entireContentOpened && this.contentMetadata && this.contentId && this.customDataProvided) {
+				this.doOpenEntireContent();
+			}
+		}
+
+		this.sendEvent(EVENT.LOAD_AND_PLAY_15, this.adMetadata);
+		this.adBlockOpened = true;
+		this.lastAdAssetId = this.adMetadata.assetid;
+		this.lastAdPosition = -1;
+                this.lastAdExactPosition = -1;
+
+		// Clean this.arContTime here. We should not pop and content time stamps previously saved,
+		// if we are handling the Ad.
+		this.arContTime = [];
+
+		var i;
+		for (i=0; i<this.arAdTime.length; i++ ) {
+			var obj = this.arAdTime[i]; 
+			this.log(DEBUG_LEVEL.PLUGIN, "adTime is poped");
+			this.doTickAd(obj);
+		}
+		this.arAdTime = [];
+	}
+
+	PluginModule.prototype.doCloseAdBlock = function (evtObj)
+	{
+		if (this.adBlockOpened) {
+			this.sendEvent(EVENT.STOP_7, this.lastAdPosition);
+			this.adBlockOpened = false;
+
+			this.adMetadata = null;
+		}
+	}
+
+	PluginModule.prototype.doTickAd = function (evtObj)
+	{
+            if (evtObj && typeof evtObj.position === "number") {
+                this.lastAdExactPosition = evtObj["position"];
+		var currPos = this.roundPos(this.lastAdExactPosition);
+		if (currPos !== this.lastAdPosition) {
+			this.log(DEBUG_LEVEL.DEBUG, "doTickAd, position to round=" + evtObj.position);
+ 			this.lastAdPosition = currPos;
+			this.sendEvent(EVENT.TICK_49, currPos);
+		}
+            }
+	}
+
+	PluginModule.prototype.doLastTickAd = function ()
+	{
+            var currPos = Math.round(this.lastAdExactPosition);
+            if (currPos !== this.lastAdPosition) {
+                    this.log(DEBUG_LEVEL.DEBUG, "doLastTickAd, position to round=" + this.lastAdExactPosition);
+                    this.lastAdPosition = currPos;
+                    this.sendEvent(EVENT.TICK_49, currPos);
+            }
+	}
+
+	PluginModule.prototype.doOpenContBlock = function ()
+	{
+		if (!this.entireContentOpened) {
+			this.doOpenEntireContent();
+		}
+
+		// Length of the content might be changed after some ads have been played.
+		// Need to update contentMetadataForOpenedSession that is used in event(15)
+                if (this.contentMetadataForOpenedSession) {
+                    if (this.contentMetadata) {
+                            this.contentMetadataForOpenedSession.length = this.contentMetadata.length;
+                    }
+
+                    this.sendEvent(EVENT.LOAD_AND_PLAY_15, this.contentMetadataForOpenedSession);
+                    this.updateContentLength(this.contentMetadataForOpenedSession.length);
+                    this.contBlockOpened = true;
+                }
+		this.sendId3FromArray();
+                this.errNoLengthPrinted = false;
+
+		var i;
+		for (i=0; i<this.arContTime.length; i++ ) {
+			var obj = this.arContTime[i]; 
+			this.log(DEBUG_LEVEL.PLUGIN, "contTime is poped");
+			this.doTickCont(obj);
+		}
+		this.arContTime = [];
+	}
+
+	PluginModule.prototype.updateContentLength = function (length)
+	{
+		if (this.lastContentLengthSentToSDK != length) {
+			var lengthObj = { "length" : length };
+			this.sendEvent(EVENT.UPDATE_LENGTH_35, lengthObj);
+			this.lastContentLengthSentToSDK = length;
+                        this.errNoLengthPrinted = false;
+		}
+	}			
+
+	PluginModule.prototype.doCloseContBlock = function ()
+	{
+		if (this.contBlockOpened) {
+			this.sendEvent(EVENT.STOP_7, this.lastPlayerPos);
+			this.contBlockOpened = false;
+		}
+	}
+
+	PluginModule.prototype.doCloseEntireCont = function ()
+	{
+		if (this.entireContentOpened) {
+			this.sendEvent(EVENT.END_57, this.lastPlayerPos);
+			this.entireContentOpened = false;
+		}
+	}
+
+	PluginModule.prototype.closeEntireCont = function ()
+	{
+		if (this.contBlockOpened) {
+			this.doCloseContBlock();
+		}
+
+		if (this.entireContentOpened) {
+			this.doCloseEntireCont();
+		}
+	}
+
+	PluginModule.prototype.doTickCont = function (evtObj)
+	{
+            if (evtObj && typeof evtObj.position === "number") {
+		var currPos = this.roundPos(evtObj["position"]);
+
+		this.lastPlayerPosExact = evtObj["stream_position"];
+		// it's the position  returned from the player, not the timestamp generated for the live stream
+
+		if (currPos != this.lastPlayerPos)
+		{
+                        if (!this.errNoLengthPrinted &&
+                                (this.contentMetadataForOpenedSession.length == null || this.contentMetadataForOpenedSession.length == 0)) {
+                                this.log(DEBUG_LEVEL.ERR, "No content length is provided");
+                                this.errNoLengthPrinted = true;
+                        }
+			this.lastPlayerPos = currPos;
+			this.sendEvent(EVENT.TICK_49, currPos);
+		}
+            }
+	}
+
+	PluginModule.prototype.doMetaId3 = function (evtObj)
+	{
+		var metaId3 = evtObj["id3"];
+		this.sendEvent(EVENT.ID3_55, metaId3);
+	}
+
+	function truncate(number)
+	{
+		return number > 0
+		? Math.floor(number)
+				: Math.ceil(number);
+	}
+
+	PluginModule.prototype.roundPos = function (pos) {
+//		var t = Math.trunc(pos);	// It's not supported under IE 11 + Win 8, Win 10.
+		var t = truncate(pos);
+		return t;
+	}
+
+	PluginModule.prototype.isContentMetadataCorrect = function() {
+		// TODO: length should not be checked here, because it can be undefined. It's correct for sending event3/15
+		// If then it's updated we send event 35
+		// Consider using it for future release 
+		/*
+		if (this.contentMetadata !== null &&
+				typeof this.contentMetadata.assetid !== 'undefined' &&
+				typeof this.contentMetadata.type !== 'undefined') {
+			return true;
+		}
+		*/
+		if (this.contentMetadata !== null &&
+//				typeof this.contentMetadata.assetid !== 'undefined' &&
+				this.contentId !== null &&
+				typeof this.contentMetadata.type !== 'undefined' &&
+				typeof this.contentMetadata.length !== 'undefined') {
+			return true;
+		}
+		return false;
+	}
+
+	PluginModule.prototype.isAdMetadataCorrect = function() {
+		if (this.adMetadata !== null &&
+				typeof this.adMetadata.assetid !== 'undefined' && 
+				typeof this.adMetadata.type !== 'undefined' &&
+				typeof this.adMetadata.length !== 'undefined') {
+			return true;
+		}
+		return false;
+	}
+
+	PluginModule.prototype.isTimeupdateCorrect = function(evt) {
+		if (!this.entireContentOpened) {
+                    if (evtObj && typeof evtObj.position === "number") {
+			this.log(DEBUG_LEVEL.PLUGIN, "session is not opened, pos=" + evt.position + ", old_pos=" + this.lastPlayerPosExact);
+			if (this.lastPlayerPosExact != -1 &&
+					evt.position > this.lastPlayerPosExact && (evt.position - this.lastPlayerPosExact) <= NEAR_TIME_UPDATES_MAX) {
+				// This tick can be received from the previous stream. If so, it should be ignored.
+
+				return false;
+			}
+                    }
+                    else return false;  // Impossible. It's an error in the code.
+		}
+		return true;
+	}
+
+	PluginModule.prototype.isAfterEntireContentClosed = function() {
+		if (!this.entireContentOpened) {
+			return true;
+		}
+		return false;
+	}
+
+	PluginModule.prototype.playerEvent_AD_STARTED_Received = function () {
+		if (this.adBlockOpened &&
+				this.adMetadata && this.lastAdAssetId != this.adMetadata.assetid) {
+			this.doCloseAdBlock(null);
+		}
+
+		this.doCloseContBlock();
+
+//		if (this.contentMetadata && this.lastAssetId != this.contentMetadata.assetid) {
+		if (this.contentMetadata && this.lastAssetId != this.contentId) {
+			this.doCloseEntireCont();
+		}
+
+		if (this.adMetadata && this.adMetadata.type == "postroll" && this.noPostrolls == 0) {
+			this.doCloseEntireCont();
+		}
+
+		// Assert: this.adBlockOpened == false 
+
+		if (this.isAdMetadataCorrect()) {
+			this.doOpenAdBlock();
+		}
+	}
+
+	PluginModule.prototype.isContentChanged = function (contAssetId)
+	{
+		if ( typeof contAssetId !== "undefined" && contAssetId != null 
+			&& 
+			( !this.contentMetadataForOpenedSession
+			  ||
+			  this.contentMetadataForOpenedSession
+				&& ( this.contentIdForOpenedSession !== contAssetId || this.contentIdForOpenedSession === null)
+			)
+			
+			// The following is the code for streams with no metadata					
+			|| (typeof contAssetId === "undefined" || contAssetId == null)
+				&& this.contentMetadataForOpenedSession
+				&& this.contentIdForOpenedSession !== null
+
+		) {
+            /*
+			this.log(DEBUG_LEVEL.PLUGIN, "Content is changed. Prev assetid=" +
+					(this.contentMetadataForOpenedSession ? this.contentIdForOpenedSession : "<null metadata>") +
+					", new assetid="+ contAssetId);
+			this.log(DEBUG_LEVEL.PLUGIN, "Content is changed. New assetid=" + contAssetId);
+            */
+			return true;
+		}
+	}
+
+	PluginModule.prototype.playerEventReceived = function (evt, evtObj)
+	{
+            try {
+		switch(evt)
+		{
+		case PLAYER_EVENT.IDLE:
+			break; 
+
+		case PLAYER_EVENT.AD_STARTED:
+			this.playerEvent_AD_STARTED_Received();
+			break; 
+
+		case PLAYER_EVENT.AD_STOPPED:
+			if(this.adBlockOpened)
+			{
+				this.doLastTickAd();
+			}
+
+                        this.doCloseAdBlock(null);
+			break; 
+
+		case PLAYER_EVENT.AD_TICK:
+			// Ad block should be opened after onAdImpression is received.
+			// In some players "ad started" event (like "onAdImpression") can come later,
+			// and the metadata for the Ad is not correct until "ad started".
+			// The method doOpenAdBlock tries to use metadata from the even object that is provided by
+			// the player specific part of the plugin
+			// Note,
+			// Some players don't fire AdImpression and AdPlay events for the post-roll if we use FLASH
+			// So, we need to open Ad block after the first AD_TICK comes up. 
+
+			if(!this.adBlockOpened)
+			{
+				this.log(DEBUG_LEVEL.PLUGIN, "adTime is pushed");
+				this.arAdTime.push(evtObj);
+				this.playerEvent_AD_STARTED_Received();
+			}
+			else {
+				this.doTickAd(evtObj);
+			}
+
+			break;
+
+		case PLAYER_EVENT.CONT_STARTED:
+			// This event is not fired when re-playing
+			// So, no reason to use it at all.
+			// Metadata should be received in METADATA_LOADED event
+
+			// If METADATA_LOADED event is not fired for some reason,
+			// we will use metadata taken from the player after "time update" comes up.
+			// But it seems not a good solution. metadata can be wrong if METADATA_LOADED event is not fired.
+			// It's necessary to wait for the problem is fixed on the player side.
+
+			break; 
+
+		case PLAYER_EVENT.CONT_STOPPED:
+			this.doCloseContBlock();
+			break; 
+
+		case PLAYER_EVENT.CONT_ENDED:	// Final end (completed)
+			// This is a workaround.
+			// Some players fire "complete" event after all post-rolls are finished
+			// Other players fire this event after the video completed, but before the first post-roll starts.
+
+			// According to the documentation https://engineeringforum.nielsen.com/sdk/developers/bsdk-product-agf.php
+			// we need to send 57 before the first post-roll if it exists.
+
+			if (this.ignoreNextEndedEvent) {
+				this.ignoreNextEndedEvent = false;
+				this.log(DEBUG_LEVEL.PLUGIN, "This 'Ended' event is ignored");
+				return;
+			}
+
+			this.closeEntireCont();
+
+			break;
+
+		case PLAYER_EVENT.CONT_TICK:
+			var currPos = evtObj["position"];	// No rounding
+			var duration = evtObj["duration"];
+
+			if (currPos === 0 || currPos === null) {
+				// Ignore 0, because sometimes it's a wrong time stamp.
+				// E.g. while switching from one stream to another
+				// Even if this time stamp is correct, we can ignore it (exact "0"),
+				// because then we should get some value a bit bigger than 0, e.g. "0.1", which should be correct for sure. 
+				return;
+			}
+
+			if (this.plugin.videoType !== VIDEO_TYPE.LIVE &&
+					!this.entireContentOpened &&	// Entire content is closed (after 57), but ticks are still being sent. 
+					this.contentMetadataForOpenedSession &&
+					currPos >= this.plugin.getDuration() - PLAYER_NEAR_END) {
+				// This tick can be received multiple times at the end of the stream. If so, these ticks should be ignored.
+				this.log(DEBUG_LEVEL.PLUGIN, "ignore a tick at the end. currPos=" + currPos);
+				
+				return;
+			}
+
+//			if (!this.contBlockOpened && this.contentMetadata && this.contentMetadata.assetid) {
+			if (!this.contBlockOpened && this.contentMetadata && this.contentId && this.customDataProvided) {
+				this.log(DEBUG_LEVEL.PLUGIN, "Calling CONT_STARTED from CONT_TICK");
+				this.doOpenContBlock();
+			}
+
+			if (this.contBlockOpened /* && this.contentMetadata && this.contentId */) {
+				this.doTickCont(evtObj);
+			}
+
+			if (this.plugin.videoType !== VIDEO_TYPE.LIVE && currPos >= this.plugin.getDuration() - PLAYER_NEAR_END) {
+				this.log(DEBUG_LEVEL.PLUGIN, "Position reached the end. Closing entire content...");
+
+				this.closeEntireCont();
+
+				this.ignoreNextEndedEvent = true;
+			}
+			break;
+
+		case PLAYER_EVENT.PLAYLIST_ITEM_CHANGED:
+			if (this.entireContentOpened) {
+				this.closeEntireCont();
+				this.sessionOpened = false;
+
+				this.log(DEBUG_LEVEL.DEBUG, "Previous session is closed");
+			}
+
+			this.contentMetadataForOpenedSession = null;
+			this.contentMetadata = null;
+
+			this.contentIdForOpenedSession = null;
+			this.contentId = null;
+
+			break;
+
+		case PLAYER_EVENT.METADATA_LOADED:
+			// Some players call this event twice when playing LIVE streams
+
+			if (this.entireContentOpened && evtObj["contentMetadata"] && typeof evtObj["contentId"] === "undefined") {
+				// Update metadata (probably with length value) for the session that is already opened 
+				this.contentMetadataForOpenedSession = merge_objects(this.contentMetadataForOpenedSession, evtObj["contentMetadata"]);
+				this.log(DEBUG_LEVEL.DEBUG, "contentMetadataForOpenedSession=" + printObject(this.contentMetadataForOpenedSession));
+				this.log(DEBUG_LEVEL.DEBUG, "contentId=" + printObject(this.contentId));
+			}
+			else {
+				this.contentMetadata = merge_objects(this.contentMetadata, evtObj["contentMetadata"]);
+				if (evtObj["contentId"]) this.contentId = evtObj["contentId"];
+				this.log(DEBUG_LEVEL.DEBUG, "contentMetadata=" + printObject(this.contentMetadata));
+				this.log(DEBUG_LEVEL.DEBUG, "contentId=" + printObject(this.contentId));
+			}
+
+			break;
+
+		case PLAYER_EVENT.AD_METADATA_LOADED:
+			// Some players call this event twice when playing LIVE streams
+			this.adMetadata = merge_objects(this.adMetadata, evtObj["adMetadata"]);
+			this.log(DEBUG_LEVEL.DEBUG, "adMetadata=" + printObject(this.adMetadata));
+
+			break;
+
+		case PLAYER_EVENT.META_ID3:
+			this.doMetaId3(evtObj);
+			break;
+
+		default:
+			this.log(DEBUG_LEVEL.ERR, "Error: Illegal player event code.");
+		break; 
+		}
+            } catch(e) {
+                this.log(DEBUG_LEVEL.ERR, e.message);
+            }
+            return;
+	}
+
+	return {
+		PluginModule: PluginModule,
+		printObject : printObject,
+		DEBUG_LEVEL : DEBUG_LEVEL,
+		VIDEO_TYPE : VIDEO_TYPE,
+		PLAYER_EVENT : PLAYER_EVENT,
+		INFINITY_VALUE: INFINITY_VALUE,
+		saveXml: this.saveXml
+	};
+
+})();	// NT.PLUGIN

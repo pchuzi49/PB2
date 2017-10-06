@@ -1,0 +1,3 @@
+define(['netkit-jquery-private'], function($) {
+  return $.noConflict(true)
+});
