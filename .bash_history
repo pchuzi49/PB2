@@ -27,3 +27,12 @@ git commit -m "personal Blog"
 git remote add origin https://github.com/pchuzi49/personal-blog.git
 git push -u origin master
 git push -u origin master
+cd C:/ Users/pchuzie/Desktop/PB2
+git init.
+git init
+git add .
+git add .
+git commit -m "PB2"
+git push
+git remote add origin https://github.com/pchuzi49/PB2.git
+git push -u origin master
